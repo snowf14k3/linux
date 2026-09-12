@@ -234,6 +234,13 @@ static int venc_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
 	return 0;
 }
 
+void venc_mark_config_dirty(struct venus_inst *inst)
+{
+	if (IS_IRIS1(inst->core) &&
+	    inst->enc_state == VENUS_ENC_STATE_CONFIGURED)
+		inst->enc_state = VENUS_ENC_STATE_INIT;
+}
+
 static int venc_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 {
 	struct venus_inst *inst = to_inst(file);
@@ -297,6 +304,8 @@ static int venc_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 		inst->fmt_cap = fmt;
 		inst->output_buf_size = pixmp->plane_fmt[0].sizeimage;
 	}
+
+	venc_mark_config_dirty(inst);
 
 	return 0;
 }
@@ -399,6 +408,8 @@ venc_s_selection(struct file *file, void *fh, struct v4l2_selection *s)
 		return -EINVAL;
 	}
 
+	venc_mark_config_dirty(inst);
+
 	return 0;
 }
 
@@ -431,6 +442,7 @@ static int venc_s_parm(struct file *file, void *fh, struct v4l2_streamparm *a)
 
 	inst->timeperframe = *timeperframe;
 	inst->fps = fps;
+	venc_mark_config_dirty(inst);
 
 	return 0;
 }
@@ -1064,6 +1076,21 @@ static int venc_set_properties(struct venus_inst *inst)
 	return 0;
 }
 
+static int venc_set_properties_if_needed(struct venus_inst *inst)
+{
+	int ret;
+
+	if (IS_IRIS1(inst->core) &&
+	    inst->enc_state == VENUS_ENC_STATE_CONFIGURED)
+		return 0;
+
+	ret = venc_set_properties(inst);
+	if (!ret && IS_IRIS1(inst->core))
+		inst->enc_state = VENUS_ENC_STATE_CONFIGURED;
+
+	return ret;
+}
+
 static int venc_init_session(struct venus_inst *inst)
 {
 	int ret;
@@ -1094,7 +1121,7 @@ static int venc_init_session(struct venus_inst *inst)
 	if (ret)
 		goto deinit;
 
-	ret = venc_set_properties(inst);
+	ret = venc_set_properties_if_needed(inst);
 	if (ret)
 		goto deinit;
 
@@ -1427,7 +1454,7 @@ static int venc_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (ret)
 		goto error;
 
-	ret = venc_set_properties(inst);
+	ret = venc_set_properties_if_needed(inst);
 	if (ret)
 		goto error;
 
