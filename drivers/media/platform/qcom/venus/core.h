@@ -23,9 +23,9 @@
 #define VDBGH	"VenusHigh: "
 #define VDBGFW	"VenusFW  : "
 
-#define VIDC_CLKS_NUM_MAX		4
+#define VIDC_CLKS_NUM_MAX		7
 #define VIDC_VCODEC_CLKS_NUM_MAX	2
-#define VIDC_RESETS_NUM_MAX		2
+#define VIDC_RESETS_NUM_MAX		4
 #define VIDC_MAX_HIER_CODING_LAYER 6
 
 #define VENUS_MAX_FPS			240
@@ -208,6 +208,7 @@ struct venus_core {
 	struct device *dev;
 	struct device *dev_dec;
 	struct device *dev_enc;
+	struct device *secure_nonpixel_dev;
 	unsigned int use_tz;
 	struct video_firmware {
 		struct device *dev;
@@ -334,6 +335,10 @@ struct venus_buffer {
 	struct list_head list;
 	dma_addr_t dma_addr;
 	u32 size;
+	void *extradata_va;
+	dma_addr_t extradata_dma_addr;
+	u32 extradata_size;
+	unsigned long extradata_attrs;
 	struct list_head reg_list;
 	u32 flags;
 	struct list_head ref_list;
@@ -366,6 +371,7 @@ enum venus_enc_state {
 	VENUS_ENC_STATE_ENCODING	= 2,
 	VENUS_ENC_STATE_STOPPED		= 3,
 	VENUS_ENC_STATE_DRAIN		= 4,
+	VENUS_ENC_STATE_CONFIGURED	= 5,
 };
 
 struct venus_ts_metadata {

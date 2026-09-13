@@ -5,6 +5,7 @@
  */
 #include <linux/init.h>
 #include <linux/interconnect.h>
+#include <linux/iommu.h>
 #include <linux/io.h>
 #include <linux/ioctl.h>
 #include <linux/delay.h>
@@ -303,7 +304,7 @@ static int venus_add_video_core(struct venus_core *core, const char *node_name,
 	if (!node_name)
 		return 0;
 
-	enp = of_find_node_by_name(dev->of_node, node_name);
+	enp = of_get_child_by_name(dev->of_node, node_name);
 	if (enp) {
 		of_node_put(enp);
 		return 0;
@@ -373,6 +374,45 @@ static int venus_add_dynamic_nodes(struct venus_core *core)
 
 static void venus_remove_dynamic_nodes(struct venus_core *core) {}
 #endif
+
+static int venus_get_secure_nonpixel_device(struct venus_core *core)
+{
+	struct device_node *np;
+	struct platform_device *pdev;
+
+	if (!IS_IRIS1(core))
+		return 0;
+
+	np = of_get_compatible_child(core->dev->of_node,
+				     "qcom,venus-secure-context");
+	if (!np) {
+		dev_warn(core->dev,
+			 "secure non-pixel context absent; IRIS1 encoder disabled\n");
+		return 0;
+	}
+
+	pdev = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!pdev)
+		return -EPROBE_DEFER;
+
+	if (!iommu_get_domain_for_dev(&pdev->dev)) {
+		put_device(&pdev->dev);
+		return -EPROBE_DEFER;
+	}
+
+	core->secure_nonpixel_dev = &pdev->dev;
+	return 0;
+}
+
+static void venus_put_secure_nonpixel_device(struct venus_core *core)
+{
+	if (!core->secure_nonpixel_dev)
+		return;
+
+	put_device(core->secure_nonpixel_dev);
+	core->secure_nonpixel_dev = NULL;
+}
 
 static int venus_probe(struct platform_device *pdev)
 {
@@ -487,6 +527,10 @@ static int venus_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_remove_dynamic_nodes;
 
+	ret = venus_get_secure_nonpixel_device(core);
+	if (ret)
+		goto err_of_depopulate;
+
 	ret = venus_enumerate_codecs(core, VIDC_SESSION_TYPE_DEC);
 	if (ret)
 		goto err_of_depopulate;
@@ -506,6 +550,7 @@ static int venus_probe(struct platform_device *pdev)
 	return 0;
 
 err_of_depopulate:
+	venus_put_secure_nonpixel_device(core);
 	of_platform_depopulate(dev);
 err_remove_dynamic_nodes:
 	venus_remove_dynamic_nodes(core);
@@ -543,6 +588,7 @@ static void venus_remove(struct platform_device *pdev)
 	WARN_ON(ret);
 
 	venus_shutdown(core);
+	venus_put_secure_nonpixel_device(core);
 	of_platform_depopulate(dev);
 
 	venus_firmware_deinit(core);
@@ -1119,6 +1165,40 @@ static const struct venus_resources qcm2290_res = {
 	.min_fw = &min_fw,
 };
 
+/* Conservative no-system-cache vote from the downstream bus ceiling. */
+static const struct bw_tbl sm8150_bw_table[] = {
+	{ 0, 6533000, 0, 6533000, 0 },
+};
+
+static const struct venus_resources sm8150_res = {
+	.bw_tbl_enc = sm8150_bw_table,
+	.bw_tbl_enc_size = ARRAY_SIZE(sm8150_bw_table),
+	.bw_tbl_dec = sm8150_bw_table,
+	.bw_tbl_dec_size = ARRAY_SIZE(sm8150_bw_table),
+	.clks = { "iface", "vcodec0_bus", "cvp_bus", "core",
+		  "vcodec0_core", "cvp_core", "bus" },
+	.clks_num = 7,
+	.resets = { "bus", "core", "vcodec0", "cvp" },
+	.resets_num = 4,
+	.vcodec_pmdomains = (const char *[]) { "venus", "vcodec0", "cvp" },
+	.vcodec_pmdomains_num = 3,
+	.opp_pmdomain = (const char *[]) { "mmcx" },
+	.vcodec_num = 1,
+	.max_load = 3916800,
+	.hfi_version = HFI_VERSION_4XX,
+	.vpu_version = VPU_VERSION_IRIS1,
+	.num_vpp_pipes = 2,
+	.vmem_id = VIDC_RESOURCE_NONE,
+	.dma_mask = 0xe0000000 - 1,
+	.cp_start = 0,
+	.cp_size = 0x25800000,
+	.cp_nonpixel_start = 0x1000000,
+	.cp_nonpixel_size = 0x24800000,
+	.fwname = "qcom/sm8150/venus.mbn",
+	.dec_nodename = "video-decoder",
+	.enc_nodename = "video-encoder",
+};
+
 static const struct of_device_id venus_dt_match[] = {
 	{ .compatible = "qcom,msm8916-venus", .data = &msm8916_res, },
 	{ .compatible = "qcom,msm8996-venus", .data = &msm8996_res, },
@@ -1129,6 +1209,7 @@ static const struct of_device_id venus_dt_match[] = {
 	{ .compatible = "qcom,sdm660-venus", .data = &sdm660_res, },
 	{ .compatible = "qcom,sdm845-venus", .data = &sdm845_res, },
 	{ .compatible = "qcom,sdm845-venus-v2", .data = &sdm845_res_v2, },
+	{ .compatible = "qcom,sm8150-venus", .data = &sm8150_res, },
 	{ .compatible = "qcom,sm8250-venus", .data = &sm8250_res, },
 	{ }
 };
