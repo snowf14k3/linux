@@ -288,8 +288,8 @@ int adreno_fault_handler(struct msm_gpu *gpu, unsigned long iova, int flags,
 	struct msm_drm_private *priv = gpu->dev->dev_private;
 	struct msm_mmu *mmu = to_msm_vm(gpu->vm)->mmu;
 	const char *type = "UNKNOWN";
-	bool do_devcoredump = info && (info->fsr & ARM_SMMU_FSR_SS) &&
-		!READ_ONCE(gpu->crashstate);
+	bool stall_fault = info && (info->fsr & ARM_SMMU_FSR_SS);
+	bool capture_fault;
 	unsigned long irq_flags;
 
 	/*
@@ -331,16 +331,27 @@ int adreno_fault_handler(struct msm_gpu *gpu, unsigned long iova, int flags,
 			type, block,
 			scratch[0], scratch[1], scratch[2], scratch[3]);
 
-	if (do_devcoredump) {
+	/*
+	 * A640 can report non-stalling CCU translation faults. The normal
+	 * devcoredump path only captures stalled faults, which loses the
+	 * matching TTBR0/PTE walk and VM map history for this failure mode.
+	 * Capture the first non-stalling CCU translation fault too, while
+	 * keeping hangcheck active so the normal recovery worker can run.
+	 */
+	capture_fault = !READ_ONCE(gpu->crashstate) &&
+		(stall_fault || ((info->fsr & ARM_SMMU_FSR_TF) &&
+				 block && !strcmp(block, "CCU")));
+
+	if (capture_fault) {
 		struct msm_gpu_fault_info fault_info = {};
 
-		/* Turn off the hangcheck timer to keep it from bothering us */
-		timer_delete(&gpu->hangcheck_timer);
+		if (stall_fault) {
+			/* Turn off hangcheck while the SMMU is stalled. */
+			timer_delete(&gpu->hangcheck_timer);
 
-		/* Let any concurrent GMU transactions know that the MMU may be
-		 * blocked for a while and they should wait on us.
-		 */
-		reinit_completion(&adreno_gpu->fault_coredump_done);
+			/* Let concurrent GMU transactions wait for the dump. */
+			reinit_completion(&adreno_gpu->fault_coredump_done);
+		}
 
 		fault_info.ttbr0 = info->ttbr0;
 		fault_info.iova  = iova;
@@ -350,7 +361,8 @@ int adreno_fault_handler(struct msm_gpu *gpu, unsigned long iova, int flags,
 
 		msm_gpu_fault_crashstate_capture(gpu, &fault_info);
 
-		complete_all(&adreno_gpu->fault_coredump_done);
+		if (stall_fault)
+			complete_all(&adreno_gpu->fault_coredump_done);
 	}
 
 	return 0;
