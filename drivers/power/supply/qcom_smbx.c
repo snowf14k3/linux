@@ -542,12 +542,14 @@ static void smb_status_change_work(struct work_struct *work)
 static int smb_get_iio_chan(struct smb_chip *chip, struct iio_channel *chan,
 			     int *val)
 {
+	int usb_online;
 	int rc;
-	union power_supply_propval status;
 
-	rc = power_supply_get_property(chip->chg_psy, POWER_SUPPLY_PROP_STATUS,
-				       &status);
-	if (rc < 0 || status.intval != POWER_SUPPLY_STATUS_CHARGING) {
+	rc = smb_get_prop_usb_online(chip, &usb_online);
+	if (rc < 0)
+		return rc;
+
+	if (!usb_online) {
 		*val = 0;
 		return 0;
 	}
