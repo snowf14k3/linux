@@ -264,6 +264,7 @@ static enum power_supply_property smb_properties[] = {
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_USB_TYPE,
@@ -406,6 +407,59 @@ static int smb_get_prop_status(struct smb_chip *chip, int *val)
 		*val = POWER_SUPPLY_STATUS_UNKNOWN;
 		return rc;
 	}
+}
+
+static int smb_get_charge_behaviour(struct smb_chip *chip, int *val)
+{
+	unsigned int stat;
+	int rc;
+
+	rc = regmap_read(chip->regmap, chip->base + CHARGING_ENABLE_CMD, &stat);
+	if (rc < 0) {
+		dev_err(chip->dev, "Failed to read charging enable command: %d\n",
+			rc);
+		return rc;
+	}
+
+	*val = (stat & CHARGING_ENABLE_CMD_BIT) ?
+		POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO :
+		POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
+
+	return 0;
+}
+
+static int smb_set_charge_behaviour(struct smb_chip *chip, int behaviour)
+{
+	unsigned int val;
+	int rc;
+
+	/*
+	 * Keep USB input active while inhibiting battery charging. Suspending
+	 * USBIN disables the input power path and is not a charging control.
+	 */
+	switch (behaviour) {
+	case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
+		val = CHARGING_ENABLE_CMD_BIT;
+		break;
+	case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
+		val = 0;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	rc = regmap_update_bits(chip->regmap,
+				chip->base + CHARGING_ENABLE_CMD,
+				CHARGING_ENABLE_CMD_BIT, val);
+	if (rc < 0) {
+		dev_err(chip->dev, "Failed to update charging enable command: %d\n",
+			rc);
+		return rc;
+	}
+
+	power_supply_changed(chip->chg_psy);
+
+	return 0;
 }
 
 static inline int smb_get_current_limit(struct smb_chip *chip,
@@ -621,6 +675,8 @@ static int smb_get_property(struct power_supply *psy,
 		return smb_get_prop_usb_online(chip, &val->intval);
 	case POWER_SUPPLY_PROP_STATUS:
 		return smb_get_prop_status(chip, &val->intval);
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		return smb_get_charge_behaviour(chip, &val->intval);
 	case POWER_SUPPLY_PROP_HEALTH:
 		return smb_get_prop_health(chip, &val->intval);
 	case POWER_SUPPLY_PROP_USB_TYPE:
@@ -638,9 +694,8 @@ static int smb_set_property(struct power_supply *psy,
 	struct smb_chip *chip = power_supply_get_drvdata(psy);
 
 	switch (psp) {
-	case POWER_SUPPLY_PROP_STATUS:
-		return regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
-					  USBIN_SUSPEND_BIT, !val->intval);
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		return smb_set_charge_behaviour(chip, val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return smb_set_current_limit(chip, val->intval);
 	default:
@@ -653,7 +708,7 @@ static int smb_property_is_writable(struct power_supply *psy,
 				     enum power_supply_property psp)
 {
 	switch (psp) {
-	case POWER_SUPPLY_PROP_STATUS:
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return 1;
 	default:
@@ -713,6 +768,8 @@ static irqreturn_t smb_handle_wdog_bark(int irq, void *data)
 static const struct power_supply_desc smb_psy_desc = {
 	.name = "SMB2_charger",
 	.type = POWER_SUPPLY_TYPE_USB,
+	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
+			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_SDP) |
 		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
 		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |
