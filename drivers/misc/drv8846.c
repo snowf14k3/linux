@@ -14,6 +14,7 @@
 #include <linux/hrtimer.h>
 #include <linux/interrupt.h>
 #include <linux/ioctl.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/kref.h>
 #include <linux/miscdevice.h>
@@ -36,6 +37,7 @@
 #define DRV8846_MAX_PERIOD_NS	1000000U
 #define DRV8846_MAX_MOVE_MS	1500U
 #define DRV8846_DOWN_EXTRA_MS	5U
+#define DRV8846_WATCHDOG_GRACE_JIFFIES	2U
 
 struct drv8846 {
 	struct device *dev;
@@ -59,6 +61,8 @@ struct drv8846 {
 	atomic_t move_done;
 	enum running_state state;
 	bool armed;
+	u32 last_stop_reason;
+	u32 watchdog_grace_ms;
 	bool fault_latched;
 	bool timeout_latched;
 	bool suspended;
@@ -83,24 +87,25 @@ static void drv8846_release_ref(struct kref *ref)
 }
 
 /* sleep and enable are required to be non-sleeping TLMM GPIOs. */
-static void drv8846_cut_power_locked(struct drv8846 *motor)
+static void drv8846_cut_power_locked(struct drv8846 *motor, u32 reason)
 {
+	if (motor->armed)
+		motor->last_stop_reason = reason;
 	motor->armed = false;
 	gpiod_set_value(motor->sleep, 0);
 	gpiod_set_value(motor->enable, 0);
 }
 
-static void drv8846_cut_power(struct drv8846 *motor, bool fault,
-			      bool timeout)
+static void drv8846_cut_power(struct drv8846 *motor, u32 reason)
 {
 	unsigned long flags;
 
 	spin_lock_irqsave(&motor->safety_lock, flags);
-	if (fault)
+	if (reason == DRV8846_STOP_FAULT)
 		motor->fault_latched = true;
-	if (timeout)
+	if (reason == DRV8846_STOP_TIMEOUT)
 		motor->timeout_latched = true;
-	drv8846_cut_power_locked(motor);
+	drv8846_cut_power_locked(motor, reason);
 	spin_unlock_irqrestore(&motor->safety_lock, flags);
 }
 
@@ -124,7 +129,8 @@ static bool drv8846_request_stop(struct drv8846 *motor, bool suspend,
 		motor->removing = true;
 	if (!suspend && !remove)
 		motor->pending_stops++;
-	drv8846_cut_power_locked(motor);
+	drv8846_cut_power_locked(motor, suspend || remove ?
+				 DRV8846_STOP_ABORTED : DRV8846_STOP_REQUESTED);
 	spin_unlock_irqrestore(&motor->safety_lock, flags);
 
 	return true;
@@ -167,15 +173,24 @@ static int drv8846_pwm_apply(struct drv8846 *motor, u32 period_ns, bool enable)
 	return pwm_apply_might_sleep(motor->pwm, &state);
 }
 
-static void drv8846_stop_locked(struct drv8846 *motor)
+static void drv8846_stop_locked(struct drv8846 *motor, u32 reason)
 {
 	enum running_state old_state = motor->state;
+	unsigned long flags;
 	int ret;
 
-	drv8846_cut_power(motor, false, false);
+	drv8846_cut_power(motor, reason);
+	hrtimer_cancel(&motor->watchdog);
 	ret = drv8846_pwm_apply(motor, motor->rampup_period_ns, false);
-	if (ret)
+	if (ret) {
 		dev_err(motor->dev, "failed to disable motor PWM: %d\n", ret);
+		if (old_state != STILL) {
+			spin_lock_irqsave(&motor->safety_lock, flags);
+			if (motor->last_stop_reason == reason)
+				motor->last_stop_reason = DRV8846_STOP_ERROR;
+			spin_unlock_irqrestore(&motor->safety_lock, flags);
+		}
+	}
 
 	motor->state = STILL;
 	if (old_state != STILL) {
@@ -190,7 +205,7 @@ static void drv8846_stop_work(struct work_struct *work)
 	struct drv8846 *motor = container_of(work, struct drv8846, stop_work);
 
 	mutex_lock(&motor->lock);
-	drv8846_stop_locked(motor);
+	drv8846_stop_locked(motor, DRV8846_STOP_ERROR);
 	mutex_unlock(&motor->lock);
 }
 
@@ -198,7 +213,7 @@ static enum hrtimer_restart drv8846_watchdog(struct hrtimer *timer)
 {
 	struct drv8846 *motor = container_of(timer, struct drv8846, watchdog);
 
-	drv8846_cut_power(motor, false, true);
+	drv8846_cut_power(motor, DRV8846_STOP_TIMEOUT);
 	schedule_work(&motor->stop_work);
 
 	return HRTIMER_NORESTART;
@@ -208,7 +223,7 @@ static irqreturn_t drv8846_fault_irq(int irq, void *data)
 {
 	struct drv8846 *motor = data;
 
-	drv8846_cut_power(motor, true, false);
+	drv8846_cut_power(motor, DRV8846_STOP_FAULT);
 	schedule_work(&motor->stop_work);
 
 	return IRQ_HANDLED;
@@ -241,7 +256,7 @@ static void drv8846_phase_work(struct work_struct *work)
 		break;
 	case SLOWDOWN:
 	case UNIFORMSPEED:
-		drv8846_stop_locked(motor);
+		drv8846_stop_locked(motor, DRV8846_STOP_TIMED);
 		goto out;
 	default:
 		goto out;
@@ -250,7 +265,7 @@ static void drv8846_phase_work(struct work_struct *work)
 	ret = drv8846_pwm_apply(motor, period_ns, true);
 	if (ret) {
 		dev_err(motor->dev, "failed to change motor PWM: %d\n", ret);
-		drv8846_stop_locked(motor);
+		drv8846_stop_locked(motor, DRV8846_STOP_ERROR);
 		goto out;
 	}
 
@@ -267,6 +282,7 @@ static int drv8846_start(struct drv8846 *motor, u32 direction,
 {
 	unsigned long flags;
 	u32 total_ms;
+	u32 watchdog_ms;
 	int ret;
 
 	if (direction != UP && direction != DOWN)
@@ -287,7 +303,7 @@ static int drv8846_start(struct drv8846 *motor, u32 direction,
 		goto out_command;
 	}
 
-	drv8846_cut_power(motor, false, false);
+	drv8846_cut_power(motor, DRV8846_STOP_ABORTED);
 	hrtimer_cancel(&motor->watchdog);
 	cancel_delayed_work_sync(&motor->phase_work);
 	cancel_work_sync(&motor->stop_work);
@@ -302,7 +318,7 @@ static int drv8846_start(struct drv8846 *motor, u32 direction,
 		goto out_unlock;
 	}
 
-	drv8846_stop_locked(motor);
+	drv8846_stop_locked(motor, DRV8846_STOP_ABORTED);
 	atomic_set(&motor->move_done, 0);
 
 	spin_lock_irqsave(&motor->safety_lock, flags);
@@ -345,7 +361,12 @@ static int drv8846_start(struct drv8846 *motor, u32 direction,
 	if (ret)
 		goto out_stop;
 
-	hrtimer_start(&motor->watchdog, ms_to_ktime(total_ms),
+	/* Allow phase work two ticks, without exceeding the hard move limit. */
+	watchdog_ms = min_t(u32, total_ms +
+		jiffies_to_msecs(DRV8846_WATCHDOG_GRACE_JIFFIES),
+		DRV8846_MAX_MOVE_MS);
+	motor->watchdog_grace_ms = watchdog_ms - total_ms;
+	hrtimer_start(&motor->watchdog, ms_to_ktime(watchdog_ms),
 		      HRTIMER_MODE_REL);
 	spin_lock_irqsave(&motor->safety_lock, flags);
 	if (motor->fault_latched) {
@@ -367,18 +388,18 @@ static int drv8846_start(struct drv8846 *motor, u32 direction,
 		goto out_stop;
 
 	motor->state = automatic ? SPEEDUP : UNIFORMSPEED;
-	if (automatic)
-		mod_delayed_work(system_highpri_wq, &motor->phase_work,
-				 msecs_to_jiffies(motor->rampup_duration_ms));
+	mod_delayed_work(system_highpri_wq, &motor->phase_work,
+			 msecs_to_jiffies(automatic ?
+					motor->rampup_duration_ms : duration_ms));
 	mutex_unlock(&motor->lock);
 	mutex_unlock(&motor->command_lock);
 
 	return 0;
 
 out_stop:
-	drv8846_cut_power(motor, false, false);
+	drv8846_cut_power(motor, DRV8846_STOP_ERROR);
 	hrtimer_cancel(&motor->watchdog);
-	drv8846_stop_locked(motor);
+	drv8846_stop_locked(motor, DRV8846_STOP_ERROR);
 out_unlock:
 	mutex_unlock(&motor->lock);
 out_command:
@@ -437,12 +458,29 @@ static int drv8846_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static long drv8846_remaining_ms(struct drv8846 *motor)
+{
+	long remain = 0;
+
+	mutex_lock(&motor->lock);
+	if (drv8846_is_armed(motor) && hrtimer_active(&motor->watchdog)) {
+		remain = ktime_to_ms(hrtimer_get_remaining(&motor->watchdog));
+		remain -= motor->watchdog_grace_ms;
+		remain = max(remain, 0L);
+	}
+	mutex_unlock(&motor->lock);
+
+	return remain;
+}
+
 static long drv8846_ioctl(struct file *file, unsigned int cmd,
 			  unsigned long arg)
 {
 	struct drv8846 *motor = file->private_data;
 	struct op_parameter params;
 	enum running_state state;
+	unsigned long flags;
+	u32 reason;
 	u8 direction;
 	long remain = 0;
 	int ret;
@@ -474,20 +512,14 @@ static long drv8846_ioctl(struct file *file, unsigned int cmd,
 			cancel_delayed_work_sync(&motor->phase_work);
 			cancel_work_sync(&motor->stop_work);
 			mutex_lock(&motor->lock);
-			drv8846_stop_locked(motor);
+			drv8846_stop_locked(motor, DRV8846_STOP_REQUESTED);
 			mutex_unlock(&motor->lock);
 		}
 		drv8846_finish_stop_request(motor);
 		mutex_unlock(&motor->command_lock);
 		return ret;
 	case MOTOR_IOC_GET_REMAIN_TIME:
-		mutex_lock(&motor->lock);
-		if (drv8846_is_armed(motor) &&
-		    hrtimer_active(&motor->watchdog))
-			remain = max_t(long, 0,
-				       ktime_to_ms(hrtimer_get_remaining(
-					       &motor->watchdog)));
-		mutex_unlock(&motor->lock);
+		remain = drv8846_remaining_ms(motor);
 		if (copy_to_user((void __user *)arg, &remain, sizeof(remain)))
 			return -EFAULT;
 		return 0;
@@ -496,6 +528,13 @@ static long drv8846_ioctl(struct file *file, unsigned int cmd,
 		state = drv8846_is_armed(motor) ? motor->state : STILL;
 		mutex_unlock(&motor->lock);
 		if (copy_to_user((void __user *)arg, &state, sizeof(state)))
+			return -EFAULT;
+		return 0;
+	case MOTOR_IOC_GET_STOP_REASON:
+		spin_lock_irqsave(&motor->safety_lock, flags);
+		reason = motor->last_stop_reason;
+		spin_unlock_irqrestore(&motor->safety_lock, flags);
+		if (copy_to_user((void __user *)arg, &reason, sizeof(reason)))
 			return -EFAULT;
 		return 0;
 	default:
@@ -515,13 +554,7 @@ static long drv8846_compat_ioctl(struct file *file, unsigned int cmd,
 	    _IOC_SIZE(cmd) == sizeof(compat_long_t)) {
 		if (READ_ONCE(motor->removing))
 			return -ENODEV;
-		mutex_lock(&motor->lock);
-		if (drv8846_is_armed(motor) &&
-		    hrtimer_active(&motor->watchdog))
-			remain = max_t(long, 0,
-				       ktime_to_ms(hrtimer_get_remaining(
-					       &motor->watchdog)));
-		mutex_unlock(&motor->lock);
+		remain = drv8846_remaining_ms(motor);
 		if (copy_to_user(compat_ptr(arg), &remain, sizeof(remain)))
 			return -EFAULT;
 		return 0;
@@ -601,6 +634,7 @@ static int drv8846_probe(struct platform_device *pdev)
 
 	motor->dev = dev;
 	motor->fault_irq = -1;
+	motor->last_stop_reason = DRV8846_STOP_UNKNOWN;
 	kref_init(&motor->ref);
 	mutex_init(&motor->lock);
 	mutex_init(&motor->command_lock);
@@ -717,7 +751,7 @@ static void drv8846_remove(struct platform_device *pdev)
 	cancel_delayed_work_sync(&motor->phase_work);
 	cancel_work_sync(&motor->stop_work);
 	mutex_lock(&motor->lock);
-	drv8846_stop_locked(motor);
+	drv8846_stop_locked(motor, DRV8846_STOP_ABORTED);
 	mutex_unlock(&motor->lock);
 	mutex_unlock(&motor->command_lock);
 
@@ -737,7 +771,7 @@ static void drv8846_shutdown(struct platform_device *pdev)
 	cancel_delayed_work_sync(&motor->phase_work);
 	cancel_work_sync(&motor->stop_work);
 	mutex_lock(&motor->lock);
-	drv8846_stop_locked(motor);
+	drv8846_stop_locked(motor, DRV8846_STOP_ABORTED);
 	mutex_unlock(&motor->lock);
 	mutex_unlock(&motor->command_lock);
 }
@@ -754,7 +788,7 @@ static int drv8846_suspend(struct device *dev)
 	cancel_delayed_work_sync(&motor->phase_work);
 	cancel_work_sync(&motor->stop_work);
 	mutex_lock(&motor->lock);
-	drv8846_stop_locked(motor);
+	drv8846_stop_locked(motor, DRV8846_STOP_ABORTED);
 	mutex_unlock(&motor->lock);
 	mutex_unlock(&motor->command_lock);
 

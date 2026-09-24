@@ -32,4 +32,15 @@ struct op_parameter {
 #define MOTOR_IOC_GET_REMAIN_TIME	_IOR(MOTOR_MAGIC, 0x10, long)
 #define MOTOR_IOC_GET_STATE		_IOR(MOTOR_MAGIC, 0x11, enum running_state)
 
+/* Last powered cutoff; TIMED does not verify the camera position. */
+#define DRV8846_STOP_UNKNOWN		0U
+#define DRV8846_STOP_TIMED		1U
+#define DRV8846_STOP_REQUESTED		2U
+#define DRV8846_STOP_FAULT		3U
+#define DRV8846_STOP_TIMEOUT		4U
+#define DRV8846_STOP_ERROR		5U
+#define DRV8846_STOP_ABORTED		6U
+
+#define MOTOR_IOC_GET_STOP_REASON	_IOR(MOTOR_MAGIC, 0x12, __u32)
+
 #endif /* _UAPI_MISC_DRV8846_H */

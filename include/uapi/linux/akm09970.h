@@ -72,4 +72,17 @@ struct akm09970_platform_data {
 #define AKM_IOC_GET_SENSSMR \
 	_IOR(AKM_IOC_MAGIC, AKM_PRIVATE + 5, struct akm09970_platform_data)
 
+/* New samples use CLOCK_BOOTTIME; GET_SAMPLE_SNAPSHOT returns -ENODATA
+ * until a valid sample is available. The sequence increases on each sample.
+ */
+struct akm09970_sample_snapshot {
+	__u64 timestamp_ns;
+	__u32 sequence;
+	__u8 data[AKM_SENSOR_DATA_SIZE];
+	__u32 reserved;
+};
+
+#define AKM_IOC_GET_SAMPLE_SNAPSHOT \
+	_IOR(AKM_IOC_MAGIC, AKM_PRIVATE + 6, struct akm09970_sample_snapshot)
+
 #endif /* _UAPI_LINUX_AKM09970_H */
