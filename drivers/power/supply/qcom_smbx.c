@@ -15,10 +15,12 @@
 #include <linux/kernel.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeirq.h>
 #include <linux/of.h>
 #include <linux/power_supply.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
@@ -110,6 +112,8 @@ enum smb_generation {
 #define HVDCP_EN_BIT					BIT(2)
 
 #define USBIN_LOAD_CFG					0x65
+/* Downstream USBIN_BASE + 0x65 = 0x1365 for PM8150B (base 0x1000). */
+#define SMB5_USBIN_LOAD_CFG				0x365
 #define ICL_OVERRIDE_AFTER_APSD_BIT			BIT(4)
 
 #define USBIN_ICL_OPTIONS				0x366
@@ -198,6 +202,8 @@ enum smb_generation {
 #define DCP_CURRENT_UA					1500000
 #define CURRENT_MAX_UA					DCP_CURRENT_UA
 #define FAST_CHARGE_CURRENT_CAP_UA			1950000
+#define USBIN_CURRENT_LIMIT_MAX_UA			4800000
+#define PM7250B_CAPPED_INPUT_MAX_UA			3000000
 
 /* SMB2 uses 25 mA steps; SMB5 uses 50 mA steps for FCC and USB ICL. */
 #define SMB2_CURRENT_STEP_UA				25000
@@ -251,6 +257,10 @@ struct smb_chip {
 	enum smb_generation gen;
 	u8 usbin_i_ua_per_uv;
 	u32 current_step_ua;
+	u32 input_current_limit_ua;
+	struct mutex input_lock;
+	bool input_config_failed;
+	bool input_ready;
 
 	struct delayed_work status_change_work;
 	int cable_irq;
@@ -269,6 +279,7 @@ struct smb_match_data {
 	const struct smb_init_register *init_seq;
 	u8 usbin_i_ua_per_uv;
 	u32 current_step_ua;
+	u32 max_capped_input_current_ua;
 	bool limit_fcc_to_battery;
 };
 
@@ -463,9 +474,20 @@ static int smb_set_charge_behaviour(struct smb_chip *chip, int behaviour)
 		return -EINVAL;
 	}
 
+	if (chip->input_current_limit_ua) {
+		mutex_lock(&chip->input_lock);
+		if (val && (!chip->input_ready || chip->input_config_failed)) {
+			rc = chip->input_config_failed ? -EIO : -EAGAIN;
+			mutex_unlock(&chip->input_lock);
+			return rc;
+		}
+	}
+
 	rc = regmap_update_bits(chip->regmap,
 				chip->base + CHARGING_ENABLE_CMD,
 				CHARGING_ENABLE_CMD_BIT, val);
+	if (chip->input_current_limit_ua)
+		mutex_unlock(&chip->input_lock);
 	if (rc < 0) {
 		dev_err(chip->dev, "Failed to update charging enable command: %d\n",
 			rc);
@@ -490,19 +512,154 @@ static inline int smb_get_current_limit(struct smb_chip *chip, int *val)
 	return 0;
 }
 
-static int smb_set_current_limit(struct smb_chip *chip, unsigned int val)
+static int smb_set_usb_suspend(struct smb_chip *chip, bool suspend)
 {
-	unsigned char val_raw;
+	unsigned int command;
+	int rc;
 
-	if (val > 4800000) {
+	rc = regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
+				 USBIN_SUSPEND_BIT,
+				 suspend ? USBIN_SUSPEND_BIT : 0);
+	if (rc)
+		return rc;
+
+	rc = regmap_read(chip->regmap, chip->base + USBIN_CMD_IL, &command);
+	if (rc)
+		return rc;
+
+	return !!(command & USBIN_SUSPEND_BIT) == suspend ? 0 : -EIO;
+}
+
+static int smb_verify_capped_input(struct smb_chip *chip, u8 current_raw)
+{
+	unsigned int current, options, override, load;
+	int rc;
+
+	rc = regmap_read(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG,
+			 &current);
+	if (rc)
+		return rc;
+	rc = regmap_read(chip->regmap, chip->base + USBIN_ICL_OPTIONS,
+			 &options);
+	if (rc)
+		return rc;
+	rc = regmap_read(chip->regmap, chip->base + CMD_ICL_OVERRIDE,
+			 &override);
+	if (rc)
+		return rc;
+	rc = regmap_read(chip->regmap, chip->base + SMB5_USBIN_LOAD_CFG,
+			 &load);
+	if (rc)
+		return rc;
+
+	if (current != current_raw || !(options & USBIN_MODE_CHG_BIT) ||
+	    (override & ICL_OVERRIDE_BIT) ||
+	    !(load & ICL_OVERRIDE_AFTER_APSD_BIT))
+		return -EIO;
+
+	return 0;
+}
+
+static void smb_capped_input_fault(struct smb_chip *chip)
+{
+	int rc;
+
+	chip->input_config_failed = true;
+	rc = regmap_update_bits(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
+				 CHARGING_ENABLE_CMD_BIT, 0);
+	if (rc)
+		dev_err(chip->dev, "could not disable charging after ICL failure: %d\n",
+			  rc);
+
+	rc = smb_set_usb_suspend(chip, true);
+	if (rc)
+		dev_err(chip->dev, "could not suspend USB input after ICL failure: %d\n",
+			  rc);
+}
+
+static int smb_set_current_limit(struct smb_chip *chip, unsigned int val,
+				 bool resume)
+{
+	unsigned int val_raw;
+	int rc;
+
+	if (val > USBIN_CURRENT_LIMIT_MAX_UA) {
 		dev_err(chip->dev,
 			"Can't set current limit higher than 4800000uA");
 		return -EINVAL;
 	}
+	if (chip->input_current_limit_ua &&
+	    (val < chip->current_step_ua ||
+	     val > chip->input_current_limit_ua))
+		return -EINVAL;
 	val_raw = val / chip->current_step_ua;
 
-	return regmap_write(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG,
-			    val_raw);
+	if (!chip->input_current_limit_ua)
+		return regmap_write(chip->regmap,
+				    chip->base + USBIN_CURRENT_LIMIT_CFG,
+				    val_raw);
+
+	mutex_lock(&chip->input_lock);
+	if (chip->input_config_failed) {
+		smb_capped_input_fault(chip);
+		rc = -EIO;
+		goto out;
+	}
+
+	/* Never expose a partially configured high-current override to USBIN. */
+	rc = smb_set_usb_suspend(chip, true);
+	if (rc)
+		goto fail;
+	rc = regmap_write(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG,
+			  val_raw);
+	if (rc)
+		goto fail;
+	rc = regmap_update_bits(chip->regmap,
+				 chip->base + USBIN_ICL_OPTIONS,
+				 USBIN_MODE_CHG_BIT, USBIN_MODE_CHG_BIT);
+	if (rc)
+		goto fail;
+	rc = regmap_update_bits(chip->regmap, chip->base + CMD_ICL_OVERRIDE,
+				 ICL_OVERRIDE_BIT, 0);
+	if (rc)
+		goto fail;
+	rc = regmap_update_bits(chip->regmap, chip->base + SMB5_USBIN_LOAD_CFG,
+				 ICL_OVERRIDE_AFTER_APSD_BIT,
+				 ICL_OVERRIDE_AFTER_APSD_BIT);
+	if (rc)
+		goto fail;
+	rc = smb_verify_capped_input(chip, val_raw);
+	if (rc)
+		goto fail;
+
+	if (resume) {
+		rc = smb_set_usb_suspend(chip, false);
+		if (rc)
+			goto fail;
+	}
+	goto out;
+
+fail:
+	smb_capped_input_fault(chip);
+out:
+	mutex_unlock(&chip->input_lock);
+	return rc;
+}
+
+static int smb_set_current_limit_request(struct smb_chip *chip,
+					 unsigned int val)
+{
+	bool ready;
+
+	if (chip->input_current_limit_ua) {
+		mutex_lock(&chip->input_lock);
+		ready = chip->input_ready;
+		mutex_unlock(&chip->input_lock);
+		if (!ready)
+			return -EAGAIN;
+	}
+
+	return smb_set_current_limit(chip, val, true);
 }
 
 static void smb_status_change_work(struct work_struct *work)
@@ -553,7 +710,10 @@ static void smb_status_change_work(struct work_struct *work)
 		break;
 	}
 
-	rc = smb_set_current_limit(chip, current_ua);
+	if (chip->input_current_limit_ua)
+		current_ua = min(current_ua, chip->input_current_limit_ua);
+
+	rc = smb_set_current_limit_request(chip, current_ua);
 	if (rc < 0) {
 		dev_err(chip->dev, "failed to set USB input current limit: %d\n",
 			rc);
@@ -723,7 +883,7 @@ static int smb_set_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
 		return smb_set_charge_behaviour(chip, val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
-		return smb_set_current_limit(chip, val->intval);
+		return smb_set_current_limit_request(chip, val->intval);
 	default:
 		dev_err(chip->dev, "No setter for property: %d\n", psp);
 		return -EINVAL;
@@ -1002,6 +1162,7 @@ struct smb_match_data pm8150b_match_data = {
 	.gen = SMB5,
 	.usbin_i_ua_per_uv = 5,
 	.current_step_ua = SMB5_CURRENT_STEP_UA,
+	.max_capped_input_current_ua = USBIN_CURRENT_LIMIT_MAX_UA,
 	.limit_fcc_to_battery = true,
 };
 
@@ -1012,6 +1173,7 @@ struct smb_match_data pm7250b_match_data = {
 	.gen = SMB5,
 	.usbin_i_ua_per_uv = 5,
 	.current_step_ua = SMB5_CURRENT_STEP_UA,
+	.max_capped_input_current_ua = PM7250B_CAPPED_INPUT_MAX_UA,
 };
 
 
@@ -1025,6 +1187,13 @@ static int smb_init_hw(struct smb_chip *chip,
 		if (defer_charge_setup &&
 		    (init_seq[i].addr == FAST_CHARGE_CURRENT_CFG ||
 		     init_seq[i].addr == CHARGING_ENABLE_CMD))
+			continue;
+		/* The capped path installs its override before resuming USBIN. */
+		if (chip->input_current_limit_ua &&
+		    (init_seq[i].addr == USBIN_CMD_IL ||
+		     init_seq[i].addr == USBIN_ICL_OPTIONS ||
+		     init_seq[i].addr == CMD_ICL_OVERRIDE ||
+		     init_seq[i].addr == USBIN_LOAD_CFG))
 			continue;
 
 		dev_dbg(chip->dev, "%d: Writing 0x%02x to 0x%02x\n", i,
@@ -1064,6 +1233,26 @@ static int smb_init_irq(struct smb_chip *chip, int *irq, const char *name,
 	return 0;
 }
 
+static int smb_prepare_charge_current(struct smb_chip *chip)
+{
+	int rc;
+
+	rc = regmap_update_bits(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
+				 CHARGING_ENABLE_CMD_BIT, 0);
+	if (rc)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't disable charging during probe\n");
+
+	rc = regmap_update_bits(chip->regmap, chip->base + FAST_CHARGE_CURRENT_CFG,
+				 FAST_CHARGE_CURRENT_SETTING_MASK,
+				 SDP_CURRENT_UA / chip->current_step_ua);
+	if (rc)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't set provisional charge current\n");
+
+	return 0;
+}
+
 static int smb_probe(struct platform_device *pdev)
 {
 	struct power_supply_config supply_config = {};
@@ -1090,6 +1279,23 @@ static int smb_probe(struct platform_device *pdev)
 		return dev_err_probe(chip->dev, rc,
 				     "Couldn't read base address\n");
 
+	match_data = (const struct smb_match_data *)device_get_match_data(chip->dev);
+
+	chip->gen = match_data->gen;
+	chip->usbin_i_ua_per_uv = match_data->usbin_i_ua_per_uv ?
+				    match_data->usbin_i_ua_per_uv : 1;
+	chip->current_step_ua = match_data->current_step_ua;
+	if (!chip->current_step_ua)
+		return dev_err_probe(chip->dev, -EINVAL,
+				     "missing charger current step\n");
+
+	/* Shut down PM8150B battery charging before any later probe failure. */
+	if (match_data->limit_fcc_to_battery) {
+		rc = smb_prepare_charge_current(chip);
+		if (rc)
+			return rc;
+	}
+
 	chip->usb_in_v_chan = devm_iio_channel_get(chip->dev, "usbin_v");
 	if (IS_ERR(chip->usb_in_v_chan))
 		return dev_err_probe(chip->dev, PTR_ERR(chip->usb_in_v_chan),
@@ -1101,34 +1307,51 @@ static int smb_probe(struct platform_device *pdev)
 				     "Couldn't get usbin_i IIO channel\n");
 	}
 
-	match_data = (const struct smb_match_data *)device_get_match_data(chip->dev);
+	if (device_property_present(chip->dev, "input-current-limit-microamp")) {
+		rc = device_property_read_u32(chip->dev,
+					      "input-current-limit-microamp",
+					      &chip->input_current_limit_ua);
+		if (rc)
+			return dev_err_probe(chip->dev, rc,
+					     "invalid USB input current cap\n");
+		if (!match_data->max_capped_input_current_ua ||
+		    !chip->input_current_limit_ua ||
+		    chip->input_current_limit_ua >
+		    match_data->max_capped_input_current_ua ||
+		    chip->input_current_limit_ua % chip->current_step_ua)
+			return dev_err_probe(chip->dev, -EINVAL,
+					     "USB input current cap out of range\n");
+	}
 
-	chip->gen = match_data->gen;
-	chip->usbin_i_ua_per_uv = match_data->usbin_i_ua_per_uv ?
-				    match_data->usbin_i_ua_per_uv : 1;
-	chip->current_step_ua = match_data->current_step_ua;
-	if (!chip->current_step_ua)
-		return dev_err_probe(chip->dev, -EINVAL,
-				     "missing charger current step\n");
+	/* Other SMB5 models need the same fallback when the cap is opted in. */
+	if (chip->input_current_limit_ua &&
+	    !match_data->limit_fcc_to_battery) {
+		rc = smb_prepare_charge_current(chip);
+		if (rc)
+			return rc;
+	}
+
+	mutex_init(&chip->input_lock);
+	if (chip->input_current_limit_ua) {
+		rc = smb_set_usb_suspend(chip, true);
+		if (rc)
+			return dev_err_probe(chip->dev, rc,
+					     "Couldn't suspend USB input during probe\n");
+	}
 
 	dev_info(chip->dev, "Generation %s\n", chip->gen == SMB2 ? "SMB2" : "SMB5");
 
-	/* Bound PM8150B charge current before USB input is resumed. */
-	if (match_data->limit_fcc_to_battery) {
-		rc = regmap_update_bits(chip->regmap,
-			chip->base + CHARGING_ENABLE_CMD,
-			CHARGING_ENABLE_CMD_BIT, 0);
-		if (rc < 0)
+	/*
+	 * Install the 500 mA HC override before the init sequence. The capped
+	 * path keeps USBIN suspended until the whole probe is ready.
+	 */
+	if (chip->input_current_limit_ua) {
+		rc = smb_set_current_limit(chip,
+				min_t(u32, chip->input_current_limit_ua, SDP_CURRENT_UA),
+				false);
+		if (rc)
 			return dev_err_probe(chip->dev, rc,
-					     "Couldn't disable charging during probe\n");
-
-		rc = regmap_update_bits(chip->regmap,
-			chip->base + FAST_CHARGE_CURRENT_CFG,
-			FAST_CHARGE_CURRENT_SETTING_MASK,
-			SDP_CURRENT_UA / chip->current_step_ua);
-		if (rc < 0)
-			return dev_err_probe(chip->dev, rc,
-					     "Couldn't set provisional charge current\n");
+					     "Couldn't set provisional USB ICL\n");
 	}
 
 	rc = smb_init_hw(chip, match_data->init_seq,
@@ -1255,6 +1478,18 @@ static int smb_probe(struct platform_device *pdev)
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
 					     "Couldn't enable charging after probe\n");
+	}
+
+	if (chip->input_current_limit_ua) {
+		rc = smb_set_current_limit(chip,
+				min_t(u32, chip->input_current_limit_ua, SDP_CURRENT_UA),
+				true);
+		if (rc)
+			return dev_err_probe(chip->dev, rc,
+					     "Couldn't safely resume USB input\n");
+		mutex_lock(&chip->input_lock);
+		chip->input_ready = true;
+		mutex_unlock(&chip->input_lock);
 	}
 
 	/* Initialise charger state */

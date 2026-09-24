@@ -44,6 +44,23 @@ static const struct regmap_config smb1390_regmap_config = {
 	.max_register = 0x10ff,
 };
 
+static int smb1390_disable_switcher(struct smb1390 *chip)
+{
+	unsigned int control;
+	int ret;
+
+	ret = regmap_update_bits(chip->regmap, SMB1390_CORE_CONTROL1_REG,
+				 SMB1390_CMD_EN_SWITCHER_BIT, 0);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(chip->regmap, SMB1390_CORE_CONTROL1_REG, &control);
+	if (ret)
+		return ret;
+
+	return control & SMB1390_CMD_EN_SWITCHER_BIT ? -EIO : 0;
+}
+
 static const enum power_supply_property smb1390_properties[] = {
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_TEMP,
@@ -55,7 +72,7 @@ static int smb1390_get_property(struct power_supply *psy,
 				 union power_supply_propval *val)
 {
 	struct smb1390 *chip = power_supply_get_drvdata(psy);
-	unsigned int status1, status2;
+	unsigned int status1, status2, control;
 	int temp, ret;
 
 	switch (prop) {
@@ -70,6 +87,11 @@ static int smb1390_get_property(struct power_supply *psy,
 		if (ret)
 			return ret;
 
+		ret = regmap_read(chip->regmap, SMB1390_CORE_CONTROL1_REG,
+				  &control);
+		if (ret)
+			return ret;
+
 		if ((status1 & SMB1390_TEMP_ALARM_BIT) ||
 		    (status2 & SMB1390_TSD_BIT))
 			val->intval = POWER_SUPPLY_HEALTH_OVERHEAT;
@@ -78,6 +100,9 @@ static int smb1390_get_property(struct power_supply *psy,
 				     SMB1390_VIN_OV_BIT)))
 			val->intval = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
 		else if (status2 & (SMB1390_IREV_BIT | SMB1390_IOC_BIT))
+			val->intval = POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;
+		/* Any switcher enable is a fault until a policy owns this pump. */
+		else if (control & SMB1390_CMD_EN_SWITCHER_BIT)
 			val->intval = POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;
 		else
 			val->intval = POWER_SUPPLY_HEALTH_GOOD;
@@ -128,11 +153,10 @@ static int smb1390_probe(struct i2c_client *client)
 				     "failed to create register map\n");
 
 	/* No mainline policy can safely request this pump yet. */
-	ret = regmap_update_bits(chip->regmap, SMB1390_CORE_CONTROL1_REG,
-				 SMB1390_CMD_EN_SWITCHER_BIT, 0);
+	ret = smb1390_disable_switcher(chip);
 	if (ret)
 		return dev_err_probe(&client->dev, ret,
-				     "failed to disable charge pump switcher\n");
+				     "failed to disable and verify charge pump switcher\n");
 
 	ret = regmap_read(chip->regmap, SMB1390_CORE_STATUS1_REG, &status);
 	if (ret)
@@ -162,10 +186,10 @@ static void smb1390_shutdown(struct i2c_client *client)
 	struct smb1390 *chip = i2c_get_clientdata(client);
 	int ret;
 
-	ret = regmap_update_bits(chip->regmap, SMB1390_CORE_CONTROL1_REG,
-				 SMB1390_CMD_EN_SWITCHER_BIT, 0);
+	ret = smb1390_disable_switcher(chip);
 	if (ret)
-		dev_err(&client->dev, "failed to disable switcher: %d\n", ret);
+		dev_err(&client->dev, "failed to disable and verify switcher: %d\n",
+			ret);
 }
 
 static void smb1390_remove(struct i2c_client *client)

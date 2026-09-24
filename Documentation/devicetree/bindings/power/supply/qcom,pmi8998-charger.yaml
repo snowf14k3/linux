@@ -42,6 +42,18 @@ properties:
 
   monitored-battery: true
 
+  input-current-limit-microamp:
+    description: |
+      PM8150B/PM7250B board ceiling for USB input current. This is
+      separate from the battery fast-charge current in the
+      monitored-battery node. With a ceiling configured, current updates
+      briefly suspend USBIN while the software override is programmed
+      and checked. After a configuration error, the driver requests
+      USBIN suspend and refuses further updates until reprobe.
+    minimum: 50000
+    maximum: 4800000
+    multipleOf: 50000
+
 required:
   - compatible
   - reg
@@ -53,6 +65,25 @@ required:
 
 allOf:
   - $ref: power-supply.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: qcom,pm7250b-charger
+    then:
+      properties:
+        input-current-limit-microamp:
+          maximum: 3000000
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - qcom,pmi8998-charger
+              - qcom,pm660-charger
+    then:
+      properties:
+        input-current-limit-microamp: false
 
 additionalProperties: false
 

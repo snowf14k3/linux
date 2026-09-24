@@ -716,6 +716,7 @@
 &pm8150b_charger {
 	status = "okay";
 	monitored-battery = <&battery>;
+	input-current-limit-microamp = <1500000>;
 };
 
 &pm8150b_vbus {
