@@ -294,6 +294,17 @@ config NVMEM_QNAP_MCU_EEPROM
 	  information, like MAC addresses for ethernet devices that do not
 	  contain their own mac storage.
 
+config NVMEM_RAPHAEL_CAMERA_EEPROM
+	tristate "Xiaomi Raphael camera raw EEPROM support"
+	depends on I2C && OF && COMMON_CLK && REGULATOR
+	depends on ARCH_QCOM || COMPILE_TEST
+	help
+	  Expose the four Raphael camera module EEPROM raw byte spans as
+	  read-only NVMEM. Reads sequence VIO, optional VAF and MCLK, then
+	  release them in reverse order. No calibration layout is decoded.
+
+	  If built as a module, it will be called raphael-camera-eeprom.
+
 config NVMEM_RAVE_SP_EEPROM
 	tristate "Rave SP EEPROM Support"
 	depends on RAVE_SP_CORE

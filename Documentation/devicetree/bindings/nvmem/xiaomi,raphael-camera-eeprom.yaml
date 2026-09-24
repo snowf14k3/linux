@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/nvmem/xiaomi,raphael-camera-eeprom.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Xiaomi Raphael camera module raw EEPROM
+
+maintainers:
+  - snowf14k3 <60956553+snowf14k3@users.noreply.github.com>
+
+description: |
+  Raphael has four camera module EEPROMs with 16-bit offsets and 8-bit
+  data. Each needs camera VIO and a 19.2 MHz MCLK while reading; the
+  main and telephoto modules also need their actuator VAF rail. The
+  contents are exposed as opaque, read-only NVMEM bytes. The matching image
+  sensor owns the shared MCLK pinmux and must be bound before EEPROM reads.
+
+allOf:
+  - $ref: nvmem.yaml#
+
+properties:
+  compatible:
+    const: xiaomi,raphael-camera-eeprom
+
+  reg:
+    maxItems: 1
+
+  size:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Raw byte span recorded by the camera module data.
+    enum: [7158, 8040, 8192]
+
+  vio-supply: true
+
+  vaf-supply: true
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    const: mclk
+
+  assigned-clocks:
+    maxItems: 1
+
+  assigned-clock-rates:
+    items:
+      - const: 19200000
+
+required:
+  - compatible
+  - reg
+  - size
+  - vio-supply
+  - clocks
+  - clock-names
+  - assigned-clocks
+  - assigned-clock-rates
+  - read-only
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/qcom,sm8150-camcc.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        eeprom@58 {
+            compatible = "xiaomi,raphael-camera-eeprom";
+            reg = <0x58>;
+            size = <8192>;
+            vio-supply = <&camera_vio>;
+            vaf-supply = <&camera_main_vaf>;
+            clocks = <&camcc CAM_CC_MCLK0_CLK>;
+            clock-names = "mclk";
+            assigned-clocks = <&camcc CAM_CC_MCLK0_CLK_SRC>;
+            assigned-clock-rates = <19200000>;
+            read-only;
+        };
+    };
+
+...

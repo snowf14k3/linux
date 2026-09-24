@@ -4,10 +4,13 @@
  * Include after sm8150-xiaomi-raphael-camera.dtsi; all new I2C clients stay
  * disabled until the camera rails and module combinations are verified.
  * EEPROM nodes expose raw bytes only. No calibration layout is assumed.
- * The main and telephoto EEPROM part numbers are unknown; at24 describes
- * their CamX 16-bit-offset read protocol. Their VAF rails need separate
- * sequencing before these two EEPROM nodes can be enabled.
+ * The EEPROM part numbers are not assumed; the read-only provider handles
+ * their CamX 16-bit-offset protocol and downstream VIO/VAF/MCLK sequencing.
+ * Sensor nodes own the shared MCLK pinmux; EEPROM reads require the matching
+ * sensor node to have selected that pin state.
  */
+
+#include <dt-bindings/clock/qcom,sm8150-camcc.h>
 
 &cci0 {
 	i2c-bus@0 {
@@ -21,18 +24,29 @@
 
 		/* CamX: 0xb0 write address, 16-bit offset, 8192-byte read span. */
 		raphael_main_eeprom: eeprom@58 {
-			compatible = "atmel,24c64";
+			compatible = "xiaomi,raphael-camera-eeprom";
 			reg = <0x58>;
-			vcc-supply = <&camera_vio>;
+			size = <8192>;
+			vio-supply = <&camera_vio>;
+			vaf-supply = <&camera_main_vaf>;
+			clocks = <&camcc CAM_CC_MCLK0_CLK>;
+			clock-names = "mclk";
+			assigned-clocks = <&camcc CAM_CC_MCLK0_CLK_SRC>;
+			assigned-clock-rates = <19200000>;
 			read-only;
 			status = "disabled";
 		};
 
 		/* CamX: 0xa8 write address, GT24P64, 8040-byte read span. */
 		raphael_front_eeprom: eeprom@54 {
-			compatible = "atmel,24c64";
+			compatible = "xiaomi,raphael-camera-eeprom";
 			reg = <0x54>;
-			vcc-supply = <&camera_vio>;
+			size = <8040>;
+			vio-supply = <&camera_vio>;
+			clocks = <&camcc CAM_CC_MCLK2_CLK>;
+			clock-names = "mclk";
+			assigned-clocks = <&camcc CAM_CC_MCLK2_CLK_SRC>;
+			assigned-clock-rates = <19200000>;
 			read-only;
 			status = "disabled";
 		};
@@ -49,9 +63,15 @@
 
 		/* CamX: 0xa0 write address, 16-bit offset, 7158-byte read span. */
 		raphael_tele_eeprom: eeprom@50 {
-			compatible = "atmel,24c64";
+			compatible = "xiaomi,raphael-camera-eeprom";
 			reg = <0x50>;
-			vcc-supply = <&camera_vio>;
+			size = <7158>;
+			vio-supply = <&camera_vio>;
+			vaf-supply = <&camera_tele_vaf>;
+			clocks = <&camcc CAM_CC_MCLK1_CLK>;
+			clock-names = "mclk";
+			assigned-clocks = <&camcc CAM_CC_MCLK1_CLK_SRC>;
+			assigned-clock-rates = <19200000>;
 			read-only;
 			status = "disabled";
 		};
@@ -62,9 +82,14 @@
 	i2c-bus@0 {
 		/* CamX: 0xa2 write address, GT24P64, 8192-byte read span. */
 		raphael_ultra_eeprom: eeprom@51 {
-			compatible = "atmel,24c64";
+			compatible = "xiaomi,raphael-camera-eeprom";
 			reg = <0x51>;
-			vcc-supply = <&camera_vio>;
+			size = <8192>;
+			vio-supply = <&camera_vio>;
+			clocks = <&camcc CAM_CC_MCLK3_CLK>;
+			clock-names = "mclk";
+			assigned-clocks = <&camcc CAM_CC_MCLK3_CLK_SRC>;
+			assigned-clock-rates = <19200000>;
 			read-only;
 			status = "disabled";
 		};
