@@ -72,9 +72,12 @@
 #define NUM_QUEUES	2
 
 #define CCI_I2C_SET_PARAM	1
+#define CCI_I2C_LOCK		6
+#define CCI_I2C_UNLOCK		7
 #define CCI_I2C_REPORT		8
 #define CCI_I2C_WRITE		9
 #define CCI_I2C_READ		10
+#define CCI_I2C_WRITE_DISABLE_P	11
 
 #define CCI_I2C_REPORT_IRQ_EN	BIT(8)
 
@@ -328,31 +331,11 @@ static int cci_validate_queue(struct cci *cci, u8 master, u8 queue)
 	return cci_run_queue(cci, master, queue);
 }
 
-static int cci_i2c_read(struct cci *cci, u16 master,
-			u16 addr, u8 *buf, u16 len)
+static int cci_i2c_read_data(struct cci *cci, u16 master, u8 *buf, u16 len)
 {
 	u32 val, words_read, words_exp;
-	u8 queue = QUEUE_1;
-	int i, index = 0, ret;
+	int i, index = 0;
 	bool first = true;
-
-	/*
-	 * Call validate queue to make sure queue is empty before starting.
-	 * This is to avoid overflow / underflow of queue.
-	 */
-	ret = cci_validate_queue(cci, master, queue);
-	if (ret < 0)
-		return ret;
-
-	val = CCI_I2C_SET_PARAM | (addr & 0x7f) << 4;
-	writel(val, cci->base + CCI_I2C_Mm_Qn_LOAD_DATA(master, queue));
-
-	val = CCI_I2C_READ | len << 4;
-	writel(val, cci->base + CCI_I2C_Mm_Qn_LOAD_DATA(master, queue));
-
-	ret = cci_run_queue(cci, master, queue);
-	if (ret < 0)
-		return ret;
 
 	words_read = readl(cci->base + CCI_I2C_Mm_READ_BUF_LEVEL(master));
 	words_exp = len / 4 + 1;
@@ -379,6 +362,34 @@ static int cci_i2c_read(struct cci *cci, u16 master,
 	} while (--words_read);
 
 	return 0;
+}
+
+static int cci_i2c_read(struct cci *cci, u16 master,
+			u16 addr, u8 *buf, u16 len)
+{
+	u8 queue = QUEUE_1;
+	u32 val;
+	int ret;
+
+	/*
+	 * Call validate queue to make sure queue is empty before starting.
+	 * This is to avoid overflow / underflow of queue.
+	 */
+	ret = cci_validate_queue(cci, master, queue);
+	if (ret < 0)
+		return ret;
+
+	val = CCI_I2C_SET_PARAM | (addr & 0x7f) << 4;
+	writel(val, cci->base + CCI_I2C_Mm_Qn_LOAD_DATA(master, queue));
+
+	val = CCI_I2C_READ | len << 4;
+	writel(val, cci->base + CCI_I2C_Mm_Qn_LOAD_DATA(master, queue));
+
+	ret = cci_run_queue(cci, master, queue);
+	if (ret < 0)
+		return ret;
+
+	return cci_i2c_read_data(cci, master, buf, len);
 }
 
 static int cci_i2c_write(struct cci *cci, u16 master,
@@ -419,6 +430,40 @@ static int cci_i2c_write(struct cci *cci, u16 master,
 	return cci_run_queue(cci, master, queue);
 }
 
+static int cci_i2c_read_reg16(struct cci *cci, u16 master,
+			      const struct i2c_msg *write, struct i2c_msg *read)
+{
+	const u8 queue = QUEUE_1;
+	u32 val;
+	int ret;
+
+	/* SET_PARAM, LOCK, WRITE_DISABLE_P, READ and UNLOCK. */
+	if (cci->data->queue_size[queue] < 5)
+		return -EOPNOTSUPP;
+
+	ret = cci_validate_queue(cci, master, queue);
+	if (ret < 0)
+		return ret;
+
+	val = CCI_I2C_SET_PARAM | (write->addr & 0x7f) << 4;
+	writel(val, cci->base + CCI_I2C_Mm_Qn_LOAD_DATA(master, queue));
+	writel(CCI_I2C_LOCK, cci->base + CCI_I2C_Mm_Qn_LOAD_DATA(master, queue));
+
+	/* The two address bytes are sent in the order supplied by the client. */
+	val = CCI_I2C_WRITE_DISABLE_P | write->len << 4 |
+	      write->buf[0] << 8 | write->buf[1] << 16;
+	writel(val, cci->base + CCI_I2C_Mm_Qn_LOAD_DATA(master, queue));
+	writel(CCI_I2C_READ | read->len << 4,
+	       cci->base + CCI_I2C_Mm_Qn_LOAD_DATA(master, queue));
+	writel(CCI_I2C_UNLOCK, cci->base + CCI_I2C_Mm_Qn_LOAD_DATA(master, queue));
+
+	ret = cci_run_queue(cci, master, queue);
+	if (ret < 0)
+		return ret;
+
+	return cci_i2c_read_data(cci, master, read->buf, read->len);
+}
+
 static int cci_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
 {
 	struct cci_master *cci_master = i2c_get_adapdata(adap);
@@ -428,6 +473,18 @@ static int cci_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
 	ret = pm_runtime_get_sync(cci->dev);
 	if (ret < 0)
 		goto err;
+
+	if (num == 2 && msgs[0].flags == 0 &&
+	    msgs[1].flags == I2C_M_RD &&
+	    msgs[0].addr == msgs[1].addr &&
+	    msgs[0].len == 2 && msgs[1].len &&
+	    msgs[1].len <= cci->data->quirks.max_read_len) {
+		ret = cci_i2c_read_reg16(cci, cci_master->master,
+					 &msgs[0], &msgs[1]);
+		if (!ret)
+			ret = num;
+		goto err;
+	}
 
 	for (i = 0; i < num; i++) {
 		if (msgs[i].flags & I2C_M_RD)
