@@ -23,6 +23,8 @@
 #define MSM_CSID_PADS_NUM 5
 
 #define MSM_CSID_PAD_SRC (MSM_CSID_PAD_FIRST_SRC)
+/* On SM8150, source slot 3 is IPP on full CSID and RDI3 on Lite CSID. */
+#define MSM_CSID_PAD_SRC_3 (MSM_CSID_PAD_FIRST_SRC + 3)
 
 /* CSID hardware can demultiplex up to 4 outputs */
 #define MSM_CSID_MAX_SRC_STREAMS	4
@@ -68,7 +70,7 @@ struct csid_phy_config {
 	u8 csiphy_id;
 	u8 lane_cnt;
 	u32 lane_assign;
-	u32 en_vc;
+	u32 en_vc; /* source path mask; SM8150 full bit 3 selects IPP */
 	u8 need_vc_update;
 };
 
@@ -80,6 +82,9 @@ struct csid_hw_ops {
 	 * @csid: CSID device
 	 */
 	void (*configure_stream)(struct csid_device *csid, u8 enable);
+
+	/* Validate a pending stream before programming hardware. */
+	int (*validate_stream)(struct csid_device *csid);
 
 	/*
 	 * configure_testgen_pattern - Validates and configures output pattern mode

@@ -11,16 +11,17 @@
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/of.h>
+#include <media/mipi-csi2.h>
 
 #include "camss-csid.h"
 #include "camss-csid-gen2.h"
 #include "camss.h"
 
-/* The CSID 2 IP-block is different from the others,
- * and is of a bare-bones Lite version, with no PIX
- * interface support. As a result of that it has an
- * alternate register layout.
+/* SM8150 full CSIDs have RDI0-2 and an IPP pixel path. The Lite CSIDs
+ * instead have RDI0-3 with an alternate RDI register layout.
  */
+#define CSID_8150_IPP_VC	0
+#define CSID_8150_IPP_PATH	(MSM_CSID_PAD_SRC_3 - MSM_CSID_PAD_FIRST_SRC)
 
 #define CSID_RST_STROBES	0x10
 #define		RST_STROBES	0
@@ -37,6 +38,10 @@
 						 + 0x10 * (rdi))
 #define CSID_CSI2_RDIN_IRQ_SET(rdi)		((csid_is_lite(csid) ? 0x3C : 0x4C) \
 						 + 0x10 * (rdi))
+
+#define CSID_CSI2_IPP_IRQ_STATUS	0x30
+#define CSID_CSI2_IPP_IRQ_MASK	0x34
+#define CSID_CSI2_IPP_IRQ_CLEAR	0x38
 
 #define CSID_TOP_IRQ_STATUS	0x70
 #define		TOP_IRQ_STATUS_RESET_DONE 0
@@ -66,6 +71,25 @@
 #define		CSI2_RX_CFG1_CGC_MODE				7
 #define			CGC_MODE_DYNAMIC_GATING		0
 #define			CGC_MODE_ALWAYS_ON		1
+
+#define CSID_IPP_CFG0			0x200
+#define		IPP_CFG0_FORMAT_MEASURE_EN	0
+#define		IPP_CFG0_TIMESTAMP_EN		1
+#define		IPP_CFG0_PIX_STORE_EN		7
+#define		IPP_CFG0_DECODE_FORMAT	12
+#define		IPP_CFG0_DATA_TYPE		16
+#define		IPP_CFG0_VIRTUAL_CHANNEL	22
+#define		IPP_CFG0_ENABLE			31
+#define CSID_IPP_CFG1			0x204
+#define CSID_IPP_CTRL			0x208
+#define CSID_IPP_FRM_DROP_PATTERN	0x20C
+#define CSID_IPP_FRM_DROP_PERIOD	0x210
+#define CSID_IPP_IRQ_SUBSAMPLE_PATTERN	0x214
+#define CSID_IPP_IRQ_SUBSAMPLE_PERIOD	0x218
+#define CSID_IPP_PIX_DROP_PATTERN	0x224
+#define CSID_IPP_PIX_DROP_PERIOD	0x228
+#define CSID_IPP_LINE_DROP_PATTERN	0x22C
+#define CSID_IPP_LINE_DROP_PERIOD	0x230
 
 #define CSID_RDI_CFG0(rdi)			((csid_is_lite(csid) ? 0x200 : 0x300) \
 						 + 0x100 * (rdi))
@@ -171,6 +195,11 @@
 #define		TPG_COLOR_BOX_CFG_MODE		0
 #define		TPG_COLOR_BOX_PATTERN_SEL	2
 
+static bool csid_has_ipp(struct csid_device *csid)
+{
+	return csid->camss->res->version == CAMSS_8150 && !csid_is_lite(csid);
+}
+
 static void __csid_configure_rx(struct csid_device *csid,
 				struct csid_phy_config *phy, int vc)
 {
@@ -203,10 +232,23 @@ static void __csid_ctrl_rdi(struct csid_device *csid, int enable, u8 rdi)
 	writel_relaxed(val, csid->base + CSID_RDI_CTRL(rdi));
 }
 
-static void __csid_configure_testgen(struct csid_device *csid, u8 enable, u8 vc)
+static void __csid_ctrl_ipp(struct csid_device *csid, u8 enable)
+{
+	u32 val;
+
+	if (enable)
+		val = HALT_CMD_RESUME_AT_FRAME_BOUNDARY << RDI_CTRL_HALT_CMD;
+	else
+		val = HALT_CMD_HALT_AT_FRAME_BOUNDARY << RDI_CTRL_HALT_CMD;
+
+	writel_relaxed(val, csid->base + CSID_IPP_CTRL);
+}
+
+static void __csid_configure_testgen(struct csid_device *csid, u8 enable,
+				     u8 vc, u8 pad)
 {
 	struct csid_testgen_config *tg = &csid->testgen;
-	struct v4l2_mbus_framefmt *input_format = &csid->fmt[MSM_CSID_PAD_FIRST_SRC + vc];
+	struct v4l2_mbus_framefmt *input_format = &csid->fmt[pad];
 	const struct csid_format_info *format = csid_get_fmt_entry(csid->res->formats->formats,
 								   csid->res->formats->nformats,
 								   input_format->code);
@@ -322,20 +364,112 @@ static void __csid_configure_rdi_stream(struct csid_device *csid, u8 enable, u8 
 	writel_relaxed(val, csid->base + CSID_RDI_CFG0(vc));
 }
 
+static const struct csid_format_info *csid_ipp_format(struct csid_device *csid)
+{
+	const struct v4l2_mbus_framefmt *input_format;
+	const struct csid_format_info *formats = csid->res->formats->formats;
+	unsigned int i;
+
+	input_format = &csid->fmt[csid->testgen.enabled ?
+				 MSM_CSID_PAD_SRC_3 : MSM_CSID_PAD_SINK];
+	for (i = 0; i < csid->res->formats->nformats; i++)
+		if (formats[i].code == input_format->code)
+			return &formats[i];
+
+	return NULL;
+}
+
+static int csid_validate_stream(struct csid_device *csid)
+{
+	const struct csid_format_info *format;
+
+	if (!csid_has_ipp(csid) ||
+	    !(csid->phy.en_vc & BIT(CSID_8150_IPP_PATH)))
+		return 0;
+
+	format = csid_ipp_format(csid);
+	if (format) {
+		switch (format->data_type) {
+		case MIPI_CSI2_DT_RAW8:
+		case MIPI_CSI2_DT_RAW10:
+		case MIPI_CSI2_DT_RAW12:
+		case MIPI_CSI2_DT_RAW14:
+			return 0;
+		}
+	}
+
+	dev_err(csid->camss->dev, "CSID IPP requires a supported RAW input format\n");
+	return -EINVAL;
+}
+
+static void __csid_configure_ipp_stream(struct csid_device *csid, u8 enable)
+{
+	const struct csid_format_info *format;
+	u32 val;
+
+	if (!enable) {
+		writel_relaxed(0, csid->base + CSID_CSI2_IPP_IRQ_MASK);
+		__csid_ctrl_ipp(csid, 0);
+		writel_relaxed(0, csid->base + CSID_IPP_CFG0);
+		return;
+	}
+
+	format = csid_ipp_format(csid);
+	if (!format)
+		return; /* csid_validate_stream() rejected this format */
+
+	/* CSID175 IPP uses VC0/CID0 independently of source pad slot 3. */
+	val = BIT(IPP_CFG0_TIMESTAMP_EN) | BIT(IPP_CFG0_FORMAT_MEASURE_EN);
+	val |= BIT(IPP_CFG0_PIX_STORE_EN);
+	val |= format->decode_format << IPP_CFG0_DECODE_FORMAT;
+	val |= format->data_type << IPP_CFG0_DATA_TYPE;
+	val |= CSID_8150_IPP_VC << IPP_CFG0_VIRTUAL_CHANNEL;
+	writel_relaxed(val, csid->base + CSID_IPP_CFG0);
+
+	/* Select the post-IRQ timestamp strobe and disable drop/subsample. */
+	val = readl_relaxed(csid->base + CSID_IPP_CFG1);
+	writel_relaxed(val | 2, csid->base + CSID_IPP_CFG1);
+	writel_relaxed(1, csid->base + CSID_IPP_FRM_DROP_PERIOD);
+	writel_relaxed(0, csid->base + CSID_IPP_FRM_DROP_PATTERN);
+	writel_relaxed(1, csid->base + CSID_IPP_IRQ_SUBSAMPLE_PERIOD);
+	writel_relaxed(0, csid->base + CSID_IPP_IRQ_SUBSAMPLE_PATTERN);
+	writel_relaxed(1, csid->base + CSID_IPP_PIX_DROP_PERIOD);
+	writel_relaxed(0, csid->base + CSID_IPP_PIX_DROP_PATTERN);
+	writel_relaxed(1, csid->base + CSID_IPP_LINE_DROP_PERIOD);
+	writel_relaxed(0, csid->base + CSID_IPP_LINE_DROP_PATTERN);
+
+	val = readl_relaxed(csid->base + CSID_IPP_CFG0);
+	writel_relaxed(val | BIT(IPP_CFG0_ENABLE), csid->base + CSID_IPP_CFG0);
+	__csid_ctrl_ipp(csid, 1);
+	writel_relaxed(BIT(1) | BIT(2), csid->base + CSID_CSI2_IPP_IRQ_MASK);
+}
+
 static void csid_configure_stream(struct csid_device *csid, u8 enable)
 {
 	struct csid_testgen_config *tg = &csid->testgen;
+	bool has_ipp = csid_has_ipp(csid);
+	u8 rdi_count = has_ipp ? 3 : MSM_CSID_MAX_SRC_STREAMS;
 	u8 i;
-	/* Loop through all enabled VCs and configure stream for each */
-	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS; i++)
+
+	for (i = 0; i < rdi_count; i++)
 		if (csid->phy.en_vc & BIT(i)) {
 			if (tg->enabled)
-				__csid_configure_testgen(csid, enable, i);
+				__csid_configure_testgen(csid, enable, i,
+							 MSM_CSID_PAD_FIRST_SRC + i);
 
 			__csid_configure_rdi_stream(csid, enable, i);
 			__csid_configure_rx(csid, &csid->phy, i);
 			__csid_ctrl_rdi(csid, enable, i);
 		}
+
+	if (has_ipp && (csid->phy.en_vc & BIT(CSID_8150_IPP_PATH))) {
+		if (tg->enabled)
+			__csid_configure_testgen(csid, enable, CSID_8150_IPP_VC,
+						 MSM_CSID_PAD_SRC_3);
+
+		__csid_configure_ipp_stream(csid, enable);
+		__csid_configure_rx(csid, &csid->phy, CSID_8150_IPP_VC);
+	}
 }
 
 static int csid_configure_testgen_pattern(struct csid_device *csid, s32 val)
@@ -356,6 +490,7 @@ static int csid_configure_testgen_pattern(struct csid_device *csid, s32 val)
 static irqreturn_t csid_isr(int irq, void *dev)
 {
 	struct csid_device *csid = dev;
+	bool has_ipp = csid_has_ipp(csid);
 	u32 val;
 	u8 reset_done;
 	int i;
@@ -367,8 +502,13 @@ static irqreturn_t csid_isr(int irq, void *dev)
 	val = readl_relaxed(csid->base + CSID_CSI2_RX_IRQ_STATUS);
 	writel_relaxed(val, csid->base + CSID_CSI2_RX_IRQ_CLEAR);
 
-	/* Read and clear IRQ status for each enabled RDI channel */
-	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS; i++)
+	if (has_ipp) {
+		val = readl_relaxed(csid->base + CSID_CSI2_IPP_IRQ_STATUS);
+		writel_relaxed(val, csid->base + CSID_CSI2_IPP_IRQ_CLEAR);
+	}
+
+	/* Full SM8150 has three RDIs; Lite retains RDI3 at source slot 3. */
+	for (i = 0; i < (has_ipp ? 3 : MSM_CSID_MAX_SRC_STREAMS); i++)
 		if (csid->phy.en_vc & BIT(i)) {
 			val = readl_relaxed(csid->base + CSID_CSI2_RDIN_IRQ_STATUS(i));
 			writel_relaxed(val, csid->base + CSID_CSI2_RDIN_IRQ_CLEAR(i));
@@ -423,6 +563,7 @@ static void csid_subdev_init(struct csid_device *csid)
 
 const struct csid_hw_ops csid_ops_gen2 = {
 	.configure_stream = csid_configure_stream,
+	.validate_stream = csid_validate_stream,
 	.configure_testgen_pattern = csid_configure_testgen_pattern,
 	.hw_version = csid_hw_version,
 	.isr = csid_isr,

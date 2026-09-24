@@ -4843,8 +4843,9 @@ static int camss_link_entities(struct camss *camss)
 
 					/*
 					 * SM8150 full CSIDs have three RDIs; their fourth
-					 * path is PIX. RDI3 links only same-index Lite blocks.
-					 * This source pad still selects CSI virtual channel 3.
+					 * path is PIX. Until full VFE PIX is implemented,
+					 * only same-index Lite RDI3 links are exposed;
+					 * Lite slot 3 selects CSI virtual channel 3.
 					 */
 					if (camss->res->version == CAMSS_8150 &&
 					    j == VFE_LINE_PIX &&

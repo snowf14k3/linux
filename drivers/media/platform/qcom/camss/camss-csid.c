@@ -758,6 +758,10 @@ static int csid_set_power(struct v4l2_subdev *sd, int on)
 static int csid_set_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct csid_device *csid = v4l2_get_subdevdata(sd);
+	bool full_ipp = csid->camss->res->version == CAMSS_8150 &&
+			!csid->res->is_lite &&
+			(csid->phy.en_vc & BIT(MSM_CSID_PAD_SRC_3 -
+					       MSM_CSID_PAD_FIRST_SRC));
 	int ret;
 
 	if (enable) {
@@ -773,9 +777,16 @@ static int csid_set_stream(struct v4l2_subdev *sd, int enable)
 		if (!csid->testgen.enabled &&
 		    !media_pad_remote_pad_first(&csid->pads[MSM_CSID_PAD_SINK]))
 			return -ENOLINK;
+
+		if (csid->res->hw_ops->validate_stream) {
+			ret = csid->res->hw_ops->validate_stream(csid);
+			if (ret)
+				return ret;
+		}
 	}
 
-	if (csid->phy.need_vc_update) {
+	/* IPP must halt and resume on every stream transition. */
+	if (csid->phy.need_vc_update || full_ipp) {
 		csid->res->hw_ops->configure_stream(csid, enable);
 		csid->phy.need_vc_update = false;
 	}
@@ -1278,7 +1289,7 @@ static int csid_link_setup(struct media_entity *entity,
 		csid->phy.lane_cnt = lane_cfg->num_data;
 		csid->phy.lane_assign = csid_get_lane_assign(lane_cfg);
 	}
-	/* Decide which virtual channels to enable based on which source pads are enabled */
+	/* Source pad bits select output paths; SM8150 full slot 3 is IPP on VC0. */
 	if (local->flags & MEDIA_PAD_FL_SOURCE) {
 		struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(entity);
 		struct csid_device *csid = v4l2_get_subdevdata(sd);
@@ -1291,7 +1302,7 @@ static int csid_link_setup(struct media_entity *entity,
 
 		csid->phy.need_vc_update = true;
 
-		dev_dbg(dev, "%s: Enabled CSID virtual channels mask 0x%x\n",
+		dev_dbg(dev, "%s: Enabled CSID source paths mask 0x%x\n",
 			__func__, csid->phy.en_vc);
 	}
 
