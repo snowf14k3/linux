@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Raphael camera peripherals from the public CamX module data.
+ * Include after sm8150-xiaomi-raphael-camera.dtsi; all new I2C clients stay
+ * disabled until the camera rails and module combinations are verified.
+ * EEPROM nodes expose raw bytes only. No calibration layout is assumed.
+ * The main and telephoto EEPROM part numbers are unknown; at24 describes
+ * their CamX 16-bit-offset read protocol. Their VAF rails need separate
+ * sequencing before these two EEPROM nodes can be enabled.
+ */
+
+&cci0 {
+	i2c-bus@0 {
+		raphael_main_vcm: camera-lens@c {
+			compatible = "dongwoon,dw9763";
+			reg = <0x0c>;
+			vin-supply = <&camera_vio>;
+			vdd-supply = <&camera_main_vaf>;
+			status = "disabled";
+		};
+
+		/* CamX: 0xb0 write address, 16-bit offset, 8192-byte read span. */
+		raphael_main_eeprom: eeprom@58 {
+			compatible = "atmel,24c64";
+			reg = <0x58>;
+			vcc-supply = <&camera_vio>;
+			read-only;
+			status = "disabled";
+		};
+
+		/* CamX: 0xa8 write address, GT24P64, 8040-byte read span. */
+		raphael_front_eeprom: eeprom@54 {
+			compatible = "atmel,24c64";
+			reg = <0x54>;
+			vcc-supply = <&camera_vio>;
+			read-only;
+			status = "disabled";
+		};
+	};
+
+	i2c-bus@1 {
+		raphael_tele_vcm: camera-lens@e {
+			compatible = "dongwoon,dw9763";
+			reg = <0x0e>;
+			vin-supply = <&camera_vio>;
+			vdd-supply = <&camera_tele_vaf>;
+			status = "disabled";
+		};
+
+		/* CamX: 0xa0 write address, 16-bit offset, 7158-byte read span. */
+		raphael_tele_eeprom: eeprom@50 {
+			compatible = "atmel,24c64";
+			reg = <0x50>;
+			vcc-supply = <&camera_vio>;
+			read-only;
+			status = "disabled";
+		};
+	};
+};
+
+&cci1 {
+	i2c-bus@0 {
+		/* CamX: 0xa2 write address, GT24P64, 8192-byte read span. */
+		raphael_ultra_eeprom: eeprom@51 {
+			compatible = "atmel,24c64";
+			reg = <0x51>;
+			vcc-supply = <&camera_vio>;
+			read-only;
+			status = "disabled";
+		};
+	};
+};
+
+/* The two existing PM8150L flash channels serve all three rear cameras. */
+&pm8150l_flash {
+	raphael_flash_white: led-1 {};
+	raphael_flash_yellow: led-2 {};
+};

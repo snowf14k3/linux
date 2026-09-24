@@ -771,6 +771,17 @@ config VIDEO_S5C73M3
 	  This is a V4L2 sensor driver for Samsung S5C73M3
 	  8 Mpixel camera.
 
+config VIDEO_RAPHAEL_SENSORS
+	tristate "Xiaomi Raphael image sensor modules"
+	depends on GPIOLIB
+	select V4L2_CCI_I2C
+	help
+	  V4L2 RAW10 sensor support for the IMX586, OV8856, S5K3L6 and
+	  S5K3T2 camera modules found in Xiaomi Raphael. This driver
+	  exposes the sensor subdevices and their board-specific modes to
+	  the Qualcomm camera subsystem. The module is named
+	  raphael-sensors.
+
 config VIDEO_S5K3M5
 	tristate "Samsung S5K3M5 sensor support"
 	select V4L2_CCI_I2C
@@ -909,6 +920,13 @@ config VIDEO_DW9719
 	  This is a driver for the DW9719 camera lens voice coil.
 	  This is designed for linear control of voice coil motors,
 	  controlled via I2C serial interface.
+
+config VIDEO_DW9763
+	tristate "DW9763 lens voice coil support"
+	select V4L2_CCI_I2C
+	help
+	  This is a V4L2 lens actuator driver for the DW9763 voice coil
+	  used by Raphael's main and telephoto camera modules.
 
 config VIDEO_DW9768
 	tristate "DW9768 lens voice coil support"

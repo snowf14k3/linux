@@ -1,0 +1,499 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Xiaomi Raphael camera wiring. Camera IDs and GPIOs follow the Android Q
+ * device tree; sensor I2C addresses follow Raphael CamX module binaries.
+ * Reset GPIOs are active high at TLMM to preserve the downstream high-to-low
+ * power-up pulse, independent of polarity at each sensor pin.
+ */
+#include <dt-bindings/clock/qcom,sm8150-camcc.h>
+#include <dt-bindings/clock/qcom,gcc-sm8150.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interconnect/qcom,sm8150.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+/ {
+	camera_vio: regulator-camera-vio {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_vio";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		vin-supply = <&vreg_s4a_1p8>;
+		gpio = <&tlmm 97 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <135>;
+		status = "disabled";
+	};
+
+	camera_main_vaf: regulator-camera-main-vaf {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_main_vaf";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		vin-supply = <&vreg_bob>;
+		gpio = <&tlmm 83 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <100>;
+		status = "disabled";
+	};
+
+	camera_tele_vaf: regulator-camera-tele-vaf {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_tele_vaf";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		vin-supply = <&vreg_bob>;
+		gpio = <&tlmm 84 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <100>;
+		status = "disabled";
+	};
+
+	camera_tele_dvdd: regulator-camera-tele-dvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_tele_dvdd";
+		regulator-min-microvolt = <1352000>;
+		regulator-max-microvolt = <1352000>;
+		vin-supply = <&vreg_s8c_1p3>;
+		gpio = <&tlmm 93 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		status = "disabled";
+	};
+
+	camera_main_dvdd: regulator-camera-main-dvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_main_dvdd";
+		regulator-min-microvolt = <1352000>;
+		regulator-max-microvolt = <1352000>;
+		vin-supply = <&vreg_s8c_1p3>;
+		gpio = <&tlmm 90 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		status = "disabled";
+	};
+
+	camera_front_dvdd: regulator-camera-front-dvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_front_dvdd";
+		regulator-min-microvolt = <1352000>;
+		regulator-max-microvolt = <1352000>;
+		vin-supply = <&vreg_s8c_1p3>;
+		gpio = <&tlmm 95 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		status = "disabled";
+	};
+
+	camera_ultra_dvdd: regulator-camera-ultra-dvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_ultra_dvdd";
+		regulator-min-microvolt = <1352000>;
+		regulator-max-microvolt = <1352000>;
+		vin-supply = <&vreg_s8c_1p3>;
+		gpio = <&tlmm 34 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		status = "disabled";
+	};
+};
+
+&tlmm {
+	camera_cci0_default: camera-cci0-default-state {
+		pins = "gpio17", "gpio18", "gpio19", "gpio20";
+		function = "cci_i2c";
+		bias-pull-up;
+		drive-strength = <2>;
+	};
+
+	camera_cci0_sleep: camera-cci0-sleep-state {
+		pins = "gpio17", "gpio18", "gpio19", "gpio20";
+		function = "cci_i2c";
+		bias-pull-down;
+		drive-strength = <2>;
+	};
+
+	camera_cci1_default: camera-cci1-default-state {
+		pins = "gpio31", "gpio32";
+		function = "cci_i2c";
+		bias-pull-up;
+		drive-strength = <2>;
+	};
+
+	camera_cci1_sleep: camera-cci1-sleep-state {
+		pins = "gpio31", "gpio32";
+		function = "cci_i2c";
+		bias-pull-down;
+		drive-strength = <2>;
+	};
+
+	camera_mclk0_default: camera-mclk0-default-state {
+		pins = "gpio13";
+		function = "cam_mclk";
+		bias-disable;
+		drive-strength = <2>;
+	};
+
+	camera_mclk1_default: camera-mclk1-default-state {
+		pins = "gpio14";
+		function = "cam_mclk";
+		bias-disable;
+		drive-strength = <2>;
+	};
+
+	camera_mclk2_default: camera-mclk2-default-state {
+		pins = "gpio15";
+		function = "cam_mclk";
+		bias-disable;
+		drive-strength = <2>;
+	};
+
+	camera_mclk3_default: camera-mclk3-default-state {
+		pins = "gpio16";
+		function = "cam_mclk";
+		bias-disable;
+		drive-strength = <2>;
+	};
+};
+
+&soc {
+	cci0: i2c-controller@ac4a000 {
+		compatible = "qcom,sm8150-cci", "qcom,msm8996-cci";
+		reg = <0 0xac4a000 0 0x1000>;
+		interrupts = <GIC_SPI 460 IRQ_TYPE_EDGE_RISING>;
+		clocks = <&camcc CAM_CC_CAMNOC_AXI_CLK>,
+				<&camcc CAM_CC_SLOW_AHB_CLK_SRC>,
+				<&camcc CAM_CC_CPAS_AHB_CLK>,
+				<&camcc CAM_CC_CCI_0_CLK>,
+				<&camcc CAM_CC_CCI_0_CLK_SRC>;
+		clock-names = "camnoc_axi", "slow_ahb_src", "cpas_ahb",
+			      "cci", "cci_src";
+		assigned-clocks = <&camcc CAM_CC_CCI_0_CLK_SRC>;
+		assigned-clock-rates = <37500000>;
+		power-domains = <&camcc TITAN_TOP_GDSC>;
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&camera_cci0_default>;
+		pinctrl-1 = <&camera_cci0_sleep>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+
+		i2c-bus@0 {
+			reg = <0>;
+			clock-frequency = <400000>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			camera@1a {
+				compatible = "sony,imx586";
+				reg = <0x1a>;
+				clocks = <&camcc CAM_CC_MCLK0_CLK>;
+				assigned-clocks = <&camcc CAM_CC_MCLK0_CLK_SRC>;
+				assigned-clock-rates = <19200000>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&camera_mclk0_default>;
+				reset-gpios = <&tlmm 28 GPIO_ACTIVE_HIGH>;
+				dovdd-supply = <&camera_vio>;
+				avdd-supply = <&vreg_bob>;
+				dvdd-supply = <&camera_main_dvdd>;
+				custom1-supply = <&vreg_s5a_2p0>;
+				lens-focus = <&raphael_main_vcm>;
+				flash-leds = <&raphael_flash_white
+					      &raphael_flash_yellow>;
+				status = "disabled";
+
+				port {
+					imx586_out: endpoint {
+						remote-endpoint = <&camss_phy0_in>;
+						data-lanes = <1 2 3 4>;
+						link-frequencies = /bits/ 64 <1049600000 574400000 870400000 363200000 916800000>;
+					};
+				};
+			};
+
+			camera@56 {
+				compatible = "samsung,s5k3t2";
+				reg = <0x56>;
+				clocks = <&camcc CAM_CC_MCLK2_CLK>;
+				assigned-clocks = <&camcc CAM_CC_MCLK2_CLK_SRC>;
+				assigned-clock-rates = <19200000>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&camera_mclk2_default>;
+				reset-gpios = <&tlmm 12 GPIO_ACTIVE_HIGH>;
+				dovdd-supply = <&camera_vio>;
+				avdd-supply = <&vreg_bob>;
+				dvdd-supply = <&camera_front_dvdd>;
+				status = "disabled";
+
+				port {
+					s5k3t2_out: endpoint {
+						remote-endpoint = <&camss_phy1_in>;
+						data-lanes = <1 2 3 4>;
+						link-frequencies = /bits/ 64 <896000000 300000000>;
+					};
+				};
+			};
+		};
+
+		i2c-bus@1 {
+			reg = <1>;
+			clock-frequency = <400000>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			camera@36 {
+				compatible = "xiaomi,raphael-ov8856";
+				reg = <0x36>;
+				clocks = <&camcc CAM_CC_MCLK1_CLK>;
+				clock-names = "xvclk";
+				assigned-clocks = <&camcc CAM_CC_MCLK1_CLK_SRC>;
+				assigned-clock-rates = <19200000>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&camera_mclk1_default>;
+				reset-gpios = <&tlmm 30 GPIO_ACTIVE_HIGH>;
+				dovdd-supply = <&camera_vio>;
+				avdd-supply = <&vreg_bob>;
+				dvdd-supply = <&camera_tele_dvdd>;
+				lens-focus = <&raphael_tele_vcm>;
+				flash-leds = <&raphael_flash_white
+					      &raphael_flash_yellow>;
+				status = "disabled";
+
+				port {
+					ov8856_out: endpoint {
+						remote-endpoint = <&camss_phy2_in>;
+						data-lanes = <1 2 3 4>;
+						link-frequencies = /bits/ 64 <360000000>;
+					};
+				};
+			};
+		};
+	};
+
+	cci1: i2c-controller@ac4b000 {
+		compatible = "qcom,sm8150-cci", "qcom,msm8996-cci";
+		reg = <0 0xac4b000 0 0x1000>;
+		interrupts = <GIC_SPI 271 IRQ_TYPE_EDGE_RISING>;
+		clocks = <&camcc CAM_CC_CAMNOC_AXI_CLK>,
+				<&camcc CAM_CC_SLOW_AHB_CLK_SRC>,
+				<&camcc CAM_CC_CPAS_AHB_CLK>,
+				<&camcc CAM_CC_CCI_1_CLK>,
+				<&camcc CAM_CC_CCI_1_CLK_SRC>;
+		clock-names = "camnoc_axi", "slow_ahb_src", "cpas_ahb",
+			      "cci", "cci_src";
+		assigned-clocks = <&camcc CAM_CC_CCI_1_CLK_SRC>;
+		assigned-clock-rates = <37500000>;
+		power-domains = <&camcc TITAN_TOP_GDSC>;
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&camera_cci1_default>;
+		pinctrl-1 = <&camera_cci1_sleep>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+
+		i2c-bus@0 {
+			reg = <0>;
+			clock-frequency = <400000>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			camera@10 {
+				compatible = "samsung,s5k3l6";
+				reg = <0x10>;
+				clocks = <&camcc CAM_CC_MCLK3_CLK>;
+				assigned-clocks = <&camcc CAM_CC_MCLK3_CLK_SRC>;
+				assigned-clock-rates = <19200000>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&camera_mclk3_default>;
+				reset-gpios = <&tlmm 23 GPIO_ACTIVE_HIGH>;
+				dovdd-supply = <&camera_vio>;
+				avdd-supply = <&vreg_bob>;
+				dvdd-supply = <&camera_ultra_dvdd>;
+				flash-leds = <&raphael_flash_white
+					      &raphael_flash_yellow>;
+				status = "disabled";
+
+				port {
+					s5k3l6_out: endpoint {
+						remote-endpoint = <&camss_phy3_in>;
+						data-lanes = <1 2 3 4>;
+						link-frequencies = /bits/ 64 <600000000>;
+					};
+				};
+			};
+		};
+	};
+
+	camss: camera-subsystem@ac65000 {
+		compatible = "qcom,sm8150-camss";
+		reg =
+			<0 0x0ac65000 0 0x1000>,
+			<0 0x0ac66000 0 0x1000>,
+			<0 0x0ac67000 0 0x1000>,
+			<0 0x0ac68000 0 0x1000>,
+			<0 0x0acb3000 0 0x1000>,
+			<0 0x0acba000 0 0x1000>,
+			<0 0x0acc8000 0 0x1000>,
+			<0 0x0accf000 0 0x1000>,
+			<0 0x0acaf000 0 0x4000>,
+			<0 0x0acb6000 0 0x4000>,
+			<0 0x0acc4000 0 0x4000>,
+			<0 0x0accb000 0 0x4000>;
+		reg-names =
+			"csiphy0",
+			"csiphy1",
+			"csiphy2",
+			"csiphy3",
+			"csid0",
+			"csid1",
+			"csid2",
+			"csid3",
+			"vfe0",
+			"vfe1",
+			"vfe_lite0",
+			"vfe_lite1";
+		interrupts =
+			<GIC_SPI 477 IRQ_TYPE_EDGE_RISING>,
+			<GIC_SPI 478 IRQ_TYPE_EDGE_RISING>,
+			<GIC_SPI 479 IRQ_TYPE_EDGE_RISING>,
+			<GIC_SPI 448 IRQ_TYPE_EDGE_RISING>,
+			<GIC_SPI 464 IRQ_TYPE_EDGE_RISING>,
+			<GIC_SPI 466 IRQ_TYPE_EDGE_RISING>,
+			<GIC_SPI 468 IRQ_TYPE_EDGE_RISING>,
+			<GIC_SPI 359 IRQ_TYPE_EDGE_RISING>,
+			<GIC_SPI 465 IRQ_TYPE_EDGE_RISING>,
+			<GIC_SPI 467 IRQ_TYPE_EDGE_RISING>,
+			<GIC_SPI 469 IRQ_TYPE_EDGE_RISING>,
+			<GIC_SPI 360 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names =
+			"csiphy0",
+			"csiphy1",
+			"csiphy2",
+			"csiphy3",
+			"csid0",
+			"csid1",
+			"csid2",
+			"csid3",
+			"vfe0",
+			"vfe1",
+			"vfe_lite0",
+			"vfe_lite1";
+		clocks =
+			<&gcc GCC_CAMERA_AHB_CLK>,
+			<&gcc GCC_CAMERA_HF_AXI_CLK>,
+			<&gcc GCC_CAMERA_SF_AXI_CLK>,
+			<&camcc CAM_CC_CAMNOC_AXI_CLK>,
+			<&camcc CAM_CC_CAMNOC_AXI_CLK_SRC>,
+			<&camcc CAM_CC_CPAS_AHB_CLK>,
+			<&camcc CAM_CC_SLOW_AHB_CLK_SRC>,
+			<&camcc CAM_CC_CSIPHY0_CLK>,
+			<&camcc CAM_CC_CSI0PHYTIMER_CLK>,
+			<&camcc CAM_CC_CSIPHY1_CLK>,
+			<&camcc CAM_CC_CSI1PHYTIMER_CLK>,
+			<&camcc CAM_CC_CSIPHY2_CLK>,
+			<&camcc CAM_CC_CSI2PHYTIMER_CLK>,
+			<&camcc CAM_CC_CSIPHY3_CLK>,
+			<&camcc CAM_CC_CSI3PHYTIMER_CLK>,
+			<&camcc CAM_CC_IFE_0_CLK>,
+			<&camcc CAM_CC_IFE_0_AXI_CLK>,
+			<&camcc CAM_CC_IFE_0_CPHY_RX_CLK>,
+			<&camcc CAM_CC_IFE_0_CSID_CLK>,
+			<&camcc CAM_CC_IFE_1_CLK>,
+			<&camcc CAM_CC_IFE_1_AXI_CLK>,
+			<&camcc CAM_CC_IFE_1_CPHY_RX_CLK>,
+			<&camcc CAM_CC_IFE_1_CSID_CLK>,
+			<&camcc CAM_CC_IFE_LITE_0_CLK>,
+			<&camcc CAM_CC_IFE_LITE_0_CPHY_RX_CLK>,
+			<&camcc CAM_CC_IFE_LITE_0_CSID_CLK>,
+			<&camcc CAM_CC_IFE_LITE_1_CLK>,
+			<&camcc CAM_CC_IFE_LITE_1_CPHY_RX_CLK>,
+			<&camcc CAM_CC_IFE_LITE_1_CSID_CLK>;
+		clock-names =
+			"cam_ahb",
+			"cam_hf_axi",
+			"cam_sf_axi",
+			"camnoc_axi",
+			"camnoc_axi_src",
+			"cpas_ahb",
+			"slow_ahb_src",
+			"csiphy0",
+			"csiphy0_timer",
+			"csiphy1",
+			"csiphy1_timer",
+			"csiphy2",
+			"csiphy2_timer",
+			"csiphy3",
+			"csiphy3_timer",
+			"vfe0",
+			"vfe0_axi",
+			"vfe0_cphy_rx",
+			"vfe0_csid",
+			"vfe1",
+			"vfe1_axi",
+			"vfe1_cphy_rx",
+			"vfe1_csid",
+			"vfe_lite0",
+			"vfe_lite0_cphy_rx",
+			"vfe_lite0_csid",
+			"vfe_lite1",
+			"vfe_lite1_cphy_rx",
+			"vfe_lite1_csid";
+		power-domains = <&camcc IFE_0_GDSC>,
+				<&camcc IFE_1_GDSC>,
+				<&camcc TITAN_TOP_GDSC>;
+		power-domain-names = "ife0", "ife1", "top";
+		vdd-csiphy-1p2-supply = <&vreg_l3c_1p2>;
+		iommus = <&apps_smmu 0x840 0x620>,
+				<&apps_smmu 0x860 0x620>,
+				<&apps_smmu 0xa40 0x620>,
+				<&apps_smmu 0xa60 0x620>,
+				<&apps_smmu 0xc40 0x620>,
+				<&apps_smmu 0xc60 0x620>,
+				<&apps_smmu 0xe40 0x620>,
+				<&apps_smmu 0xe60 0x620>;
+		interconnects =
+			<&gem_noc MASTER_AMPSS_M0 0 &config_noc SLAVE_CAMERA_CFG 0>,
+			<&mmss_noc MASTER_CAMNOC_HF0 0 &mc_virt SLAVE_EBI_CH0 0>,
+			<&mmss_noc MASTER_CAMNOC_HF1 0 &mc_virt SLAVE_EBI_CH0 0>,
+			<&mmss_noc MASTER_CAMNOC_SF 0 &mc_virt SLAVE_EBI_CH0 0>;
+		interconnect-names = "cam_ahb", "cam_hf_0_mnoc",
+				     "cam_hf_1_mnoc", "cam_sf_0_mnoc";
+		status = "disabled";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				camss_phy0_in: endpoint {
+					remote-endpoint = <&imx586_out>;
+					data-lanes = <1 2 3 4>;
+					link-frequencies = /bits/ 64 <1049600000 574400000 870400000 363200000 916800000>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+				camss_phy1_in: endpoint {
+					remote-endpoint = <&s5k3t2_out>;
+					data-lanes = <1 2 3 4>;
+					link-frequencies = /bits/ 64 <896000000 300000000>;
+				};
+			};
+
+			port@2 {
+				reg = <2>;
+				camss_phy2_in: endpoint {
+					remote-endpoint = <&ov8856_out>;
+					data-lanes = <1 2 3 4>;
+					link-frequencies = /bits/ 64 <360000000>;
+				};
+			};
+
+			port@3 {
+				reg = <3>;
+				camss_phy3_in: endpoint {
+					remote-endpoint = <&s5k3l6_out>;
+					data-lanes = <1 2 3 4>;
+					link-frequencies = /bits/ 64 <600000000>;
+				};
+			};
+		};
+	};
+};
