@@ -1874,7 +1874,7 @@ static const struct camss_subdev_resources vfe_res_8150[] = {
 		.interrupt = { "vfe_lite0" },
 		.vfe = {
 			.is_lite = true,
-			.line_num = 3,
+			.line_num = 4,
 			.hw_ops = &vfe_ops_170,
 			.formats_rdi = &vfe_formats_rdi_845,
 			.formats_pix = &vfe_formats_pix_845,
@@ -1893,7 +1893,7 @@ static const struct camss_subdev_resources vfe_res_8150[] = {
 		.interrupt = { "vfe_lite1" },
 		.vfe = {
 			.is_lite = true,
-			.line_num = 3,
+			.line_num = 4,
 			.hw_ops = &vfe_ops_170,
 			.formats_rdi = &vfe_formats_rdi_845,
 			.formats_pix = &vfe_formats_pix_845,
@@ -4840,6 +4840,16 @@ static int camss_link_entities(struct camss *camss)
 				for (j = 0; j < camss->vfe[k].res->line_num; j++) {
 					struct v4l2_subdev *csid = &camss->csid[i].subdev;
 					struct v4l2_subdev *vfe = &camss->vfe[k].line[j].subdev;
+
+					/*
+					 * SM8150 full CSIDs have three RDIs; their fourth
+					 * path is PIX. RDI3 links only same-index Lite blocks.
+					 * This source pad still selects CSI virtual channel 3.
+					 */
+					if (camss->res->version == CAMSS_8150 &&
+					    j == VFE_LINE_PIX &&
+					    (!camss->csid[i].res->is_lite || i != k))
+						continue;
 
 					ret = media_create_pad_link(&csid->entity,
 								    MSM_CSID_PAD_FIRST_SRC + j,

@@ -283,6 +283,16 @@ const struct camss_formats vfe_formats_pix_845 = {
 	.formats = formats_rdi_845
 };
 
+static bool vfe_line_is_pix(struct vfe_device *vfe, enum vfe_line_id line_id)
+{
+	/*
+	 * SM8150 Lite uses line slot 3 for RDI3. Keep the existing
+	 * line-slot interpretation for other CAMSS devices.
+	 */
+	return line_id == VFE_LINE_PIX &&
+	       !(vfe->camss->res->version == CAMSS_8150 && vfe_is_lite(vfe));
+}
+
 static u32 vfe_src_pad_code(struct vfe_line *line, u32 sink_code,
 			    unsigned int index, u32 src_req_code)
 {
@@ -681,7 +691,6 @@ int vfe_get_output_v2(struct vfe_line *line)
 
 error:
 	spin_unlock_irqrestore(&vfe->output_lock, flags);
-	output->state = VFE_OUTPUT_OFF;
 
 	return -EINVAL;
 }
@@ -861,7 +870,7 @@ void vfe_isr_comp_done(struct vfe_device *vfe, u8 comp)
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(vfe->wm_output_map); i++)
-		if (vfe->wm_output_map[i] == VFE_LINE_PIX) {
+		if (vfe_line_is_pix(vfe, vfe->wm_output_map[i])) {
 			vfe->isr_ops.wm_done(vfe, i);
 			break;
 		}
@@ -969,7 +978,7 @@ static int vfe_set_clock_rates(struct vfe_device *vfe)
 				u32 tmp;
 				u8 bpp;
 
-				if (j == VFE_LINE_PIX) {
+				if (vfe_line_is_pix(vfe, j)) {
 					tmp = pixel_clock[j];
 				} else {
 					struct vfe_line *l = &vfe->line[j];
@@ -1050,7 +1059,7 @@ static int vfe_check_clock_rates(struct vfe_device *vfe)
 				u32 tmp;
 				u8 bpp;
 
-				if (j == VFE_LINE_PIX) {
+				if (vfe_line_is_pix(vfe, j)) {
 					tmp = pixel_clock[j];
 				} else {
 					struct vfe_line *l = &vfe->line[j];
@@ -1368,7 +1377,7 @@ static void vfe_try_format(struct vfe_line *line,
 
 		fmt->code = vfe_src_pad_code(line, fmt->code, 0, code);
 
-		if (line->id == VFE_LINE_PIX) {
+		if (vfe_line_is_pix(to_vfe(line), line->id)) {
 			struct v4l2_rect *rect;
 
 			rect = __vfe_get_crop(line, sd_state, which);
@@ -1599,7 +1608,7 @@ static int vfe_set_format(struct v4l2_subdev *sd,
 		vfe_try_format(line, sd_state, MSM_VFE_PAD_SRC, format,
 			       fmt->which);
 
-		if (line->id != VFE_LINE_PIX)
+		if (!vfe_line_is_pix(to_vfe(line), line->id))
 			return 0;
 
 		/* Reset sink pad compose selection */
@@ -1633,7 +1642,7 @@ static int vfe_get_selection(struct v4l2_subdev *sd,
 	struct v4l2_rect *rect;
 	int ret;
 
-	if (line->id != VFE_LINE_PIX)
+	if (!vfe_line_is_pix(to_vfe(line), line->id))
 		return -EINVAL;
 
 	if (sel->pad == MSM_VFE_PAD_SINK)
@@ -1702,7 +1711,7 @@ static int vfe_set_selection(struct v4l2_subdev *sd,
 	struct v4l2_rect *rect;
 	int ret;
 
-	if (line->id != VFE_LINE_PIX)
+	if (!vfe_line_is_pix(to_vfe(line), line->id))
 		return -EINVAL;
 
 	if (sel->target == V4L2_SEL_TGT_COMPOSE &&
@@ -1918,7 +1927,7 @@ int msm_vfe_subdev_init(struct camss *camss, struct vfe_device *vfe,
 		init_completion(&l->output.sof);
 		init_completion(&l->output.reg_update);
 
-		if (i == VFE_LINE_PIX) {
+		if (vfe_line_is_pix(vfe, i)) {
 			l->nformats = res->vfe.formats_pix->nformats;
 			l->formats = res->vfe.formats_pix->formats;
 		} else {
@@ -2055,7 +2064,7 @@ int msm_vfe_register_entities(struct vfe_device *vfe,
 		v4l2_subdev_init(sd, &vfe_v4l2_ops);
 		sd->internal_ops = &vfe_v4l2_internal_ops;
 		sd->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
-		if (i == VFE_LINE_PIX)
+		if (vfe_line_is_pix(vfe, i))
 			snprintf(sd->name, ARRAY_SIZE(sd->name), "%s%d_%s",
 				 MSM_VFE_NAME, vfe->id, "pix");
 		else
@@ -2091,7 +2100,7 @@ int msm_vfe_register_entities(struct vfe_device *vfe,
 		video_out->ops = &vfe->video_ops;
 		video_out->bpl_alignment = vfe_bpl_align(vfe);
 		video_out->line_based = 0;
-		if (i == VFE_LINE_PIX) {
+		if (vfe_line_is_pix(vfe, i)) {
 			video_out->bpl_alignment = 16;
 			video_out->line_based = 1;
 		}

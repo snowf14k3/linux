@@ -55,13 +55,14 @@
 #define		MASK_1_VIOLATION			BIT(7)
 #define		MASK_1_BUS_BDG_HALT_ACK			BIT(8)
 #define		MASK_1_IMAGE_MASTER_n_BUS_OVERFLOW(n)	BIT((n) + 9)
-#define		MASK_1_RDI_SOF(n)			BIT((n) + 29)
+#define		MASK_1_RDI_SOF(n)			BIT((n) + 27)
 
 #define VFE_IRQ_CLEAR_0					(0x064)
 #define VFE_IRQ_CLEAR_1					(0x068)
 
 #define VFE_IRQ_STATUS_0				(0x06c)
 #define		STATUS_0_CAMIF_SOF			BIT(0)
+#define		STATUS_0_BUS_IRQ			BIT(9)
 #define		STATUS_0_RDI_REG_UPDATE(n)		BIT((n) + 5)
 #define		STATUS_0_IMAGE_MASTER_PING_PONG(n)	BIT((n) + 8)
 #define		STATUS_0_IMAGE_COMPOSITE_DONE(n)	BIT((n) + 25)
@@ -98,6 +99,7 @@
 #define VFE_BUS_IRQ_MASK(n)		(0x2044 + (n) * 4)
 #define VFE_BUS_IRQ_CLEAR(n)		(0x2050 + (n) * 4)
 #define VFE_BUS_IRQ_STATUS(n)		(0x205c + (n) * 4)
+#define VFE_BUS_IRQ_REG_NUM		3
 #define		STATUS0_COMP_RESET_DONE		BIT(0)
 #define		STATUS0_COMP_REG_UPDATE0_DONE	BIT(1)
 #define		STATUS0_COMP_REG_UPDATE1_DONE	BIT(2)
@@ -328,7 +330,7 @@ static void vfe_violation_read(struct vfe_device *vfe)
 static irqreturn_t vfe_isr(int irq, void *dev)
 {
 	struct vfe_device *vfe = dev;
-	u32 status0, status1, vfe_bus_status[VFE_LINE_NUM_MAX];
+	u32 status0, status1, vfe_bus_status[VFE_BUS_IRQ_REG_NUM];
 	int i, wm;
 
 	status0 = readl_relaxed(vfe->base + VFE_IRQ_STATUS_0);
@@ -337,7 +339,8 @@ static irqreturn_t vfe_isr(int irq, void *dev)
 	writel_relaxed(status0, vfe->base + VFE_IRQ_CLEAR_0);
 	writel_relaxed(status1, vfe->base + VFE_IRQ_CLEAR_1);
 
-	for (i = VFE_LINE_RDI0; i < vfe->res->line_num; i++) {
+	/* The bus has three IRQ banks even when a Lite VFE has four RDIs. */
+	for (i = 0; i < VFE_BUS_IRQ_REG_NUM; i++) {
 		vfe_bus_status[i] = readl_relaxed(vfe->base + VFE_BUS_IRQ_STATUS(i));
 		writel_relaxed(vfe_bus_status[i], vfe->base + VFE_BUS_IRQ_CLEAR(i));
 	}
@@ -356,15 +359,16 @@ static irqreturn_t vfe_isr(int irq, void *dev)
 			vfe->isr_ops.reg_update(vfe, i);
 
 	for (i = VFE_LINE_RDI0; i < vfe->res->line_num; i++)
-		if (status0 & STATUS_1_RDI_SOF(i))
+		if (status1 & STATUS_1_RDI_SOF(i))
 			vfe->isr_ops.sof(vfe, i);
 
 	for (i = 0; i < MSM_VFE_COMPOSITE_IRQ_NUM; i++)
 		if (vfe_bus_status[0] & STATUS0_COMP_BUF_DONE(i))
 			vfe->isr_ops.comp_done(vfe, i);
 
-	for (wm = 0; wm < MSM_VFE_IMAGE_MASTERS_NUM; wm++)
-		if (status0 & BIT(9))
+	/* Top bit 9 is the aggregate bus IRQ; status bank 1 identifies the WM. */
+	if (status0 & STATUS_0_BUS_IRQ)
+		for (wm = 0; wm < MSM_VFE_IMAGE_MASTERS_NUM; wm++)
 			if (vfe_bus_status[1] & STATUS1_WM_CLIENT_BUF_DONE(wm))
 				vfe->isr_ops.wm_done(vfe, wm);
 
@@ -442,7 +446,11 @@ static int vfe_enable(struct vfe_line *line)
 
 	mutex_unlock(&vfe->stream_lock);
 
-	ret = vfe_get_output(line);
+	/* SM8150 Lite RDI outputs are hard-wired to the matching WM index. */
+	if (vfe->camss->res->version == CAMSS_8150 && vfe_is_lite(vfe))
+		ret = vfe_get_output_v2(line);
+	else
+		ret = vfe_get_output(line);
 	if (ret < 0)
 		goto error_get_output;
 
@@ -507,7 +515,7 @@ static void vfe_isr_reg_update(struct vfe_device *vfe, enum vfe_line_id line_id)
  */
 static void vfe_isr_wm_done(struct vfe_device *vfe, u8 wm)
 {
-	struct vfe_line *line = &vfe->line[vfe->wm_output_map[wm]];
+	struct vfe_line *line;
 	struct camss_buffer *ready_buf;
 	struct vfe_output *output;
 	unsigned long flags;
@@ -521,7 +529,8 @@ static void vfe_isr_wm_done(struct vfe_device *vfe, u8 wm)
 				    "Received wm done for unmapped index\n");
 		goto out_unlock;
 	}
-	output = &vfe->line[vfe->wm_output_map[wm]].output;
+	line = &vfe->line[vfe->wm_output_map[wm]];
+	output = &line->output;
 
 	ready_buf = output->buf[0];
 	if (!ready_buf) {
