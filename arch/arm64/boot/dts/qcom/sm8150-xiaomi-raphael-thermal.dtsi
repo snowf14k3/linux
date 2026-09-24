@@ -1,0 +1,171 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Xiaomi Raphael PMIC thermistors.
+ *
+ * Downstream Raphael identifies these board connections on PM8150,
+ * PM8150B and PM8150L. The ADC5 100K_PU channel IDs select the PMIC's
+ * internal 100 kOhm pull-up and its thermistor temperature scaling.
+ *
+ * Keep each path disabled until the charging and thermal policies that
+ * consume it have been established. Battery temperature and JEITA are
+ * handled separately from these board thermistors.
+ */
+
+#include <dt-bindings/iio/qcom,spmi-vadc.h>
+
+/* PM8150B THM2 is the SMB1390 die output, defined without a pull-up. */
+&pm8150b_adc {
+	raphael_wp_therm: channel@4d {
+		reg = <ADC5_AMUX_THM1_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
+		label = "wp_therm";
+		status = "disabled";
+	};
+
+	raphael_conn_therm: channel@4f {
+		reg = <ADC5_AMUX_THM3_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
+		label = "conn_therm";
+		status = "disabled";
+	};
+};
+
+&pm8150b_adc_tm {
+	wp-therm@0 {
+		reg = <0>;
+		io-channels = <&pm8150b_adc ADC5_AMUX_THM1_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time-us = <200>;
+		qcom,pre-scaling = <1 1>;
+		status = "disabled";
+	};
+
+	conn-therm@1 {
+		reg = <1>;
+		io-channels = <&pm8150b_adc ADC5_AMUX_THM3_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time-us = <200>;
+		qcom,pre-scaling = <1 1>;
+		status = "disabled";
+	};
+};
+
+&pm8150_adc {
+	raphael_xo_therm: channel@4c {
+		reg = <ADC5_XO_THERM_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
+		label = "xo_therm";
+		status = "disabled";
+	};
+
+	raphael_quiet_therm: channel@4d {
+		reg = <ADC5_AMUX_THM1_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
+		label = "quiet_therm";
+		status = "disabled";
+	};
+
+	raphael_pa_therm0: channel@4e {
+		reg = <ADC5_AMUX_THM2_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
+		label = "pa_therm0";
+		status = "disabled";
+	};
+};
+
+&pm8150_adc_tm {
+	xo-therm@0 {
+		reg = <0>;
+		io-channels = <&pm8150_adc ADC5_XO_THERM_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time-us = <200>;
+		qcom,pre-scaling = <1 1>;
+		status = "disabled";
+	};
+
+	quiet-therm@1 {
+		reg = <1>;
+		io-channels = <&pm8150_adc ADC5_AMUX_THM1_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time-us = <200>;
+		qcom,pre-scaling = <1 1>;
+		status = "disabled";
+	};
+
+	pa-therm0@2 {
+		reg = <2>;
+		io-channels = <&pm8150_adc ADC5_AMUX_THM2_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time-us = <200>;
+		qcom,pre-scaling = <1 1>;
+		status = "disabled";
+	};
+};
+
+&pm8150l_adc {
+	raphael_camera_flash_therm: channel@4d {
+		reg = <ADC5_AMUX_THM1_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
+		label = "camera_flash_therm";
+		status = "disabled";
+	};
+
+	raphael_skin_msm_therm: channel@4e {
+		reg = <ADC5_AMUX_THM2_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
+		label = "skin_msm_therm";
+		status = "disabled";
+	};
+
+	raphael_pa_therm1: channel@4f {
+		reg = <ADC5_AMUX_THM3_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
+		label = "pa_therm1";
+		status = "disabled";
+	};
+};
+
+&pm8150l_adc_tm {
+	camera-flash-therm@0 {
+		reg = <0>;
+		io-channels = <&pm8150l_adc ADC5_AMUX_THM1_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time-us = <200>;
+		qcom,pre-scaling = <1 1>;
+		status = "disabled";
+	};
+
+	skin-msm-therm@1 {
+		reg = <1>;
+		io-channels = <&pm8150l_adc ADC5_AMUX_THM2_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time-us = <200>;
+		qcom,pre-scaling = <1 1>;
+		status = "disabled";
+	};
+
+	pa-therm1@2 {
+		reg = <2>;
+		io-channels = <&pm8150l_adc ADC5_AMUX_THM3_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time-us = <200>;
+		qcom,pre-scaling = <1 1>;
+		status = "disabled";
+	};
+};
