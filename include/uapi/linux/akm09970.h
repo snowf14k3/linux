@@ -72,8 +72,9 @@ struct akm09970_platform_data {
 #define AKM_IOC_GET_SENSSMR \
 	_IOR(AKM_IOC_MAGIC, AKM_PRIVATE + 5, struct akm09970_platform_data)
 
-/* New samples use CLOCK_BOOTTIME; GET_SAMPLE_SNAPSHOT returns -ENODATA
- * until a valid sample is available. The sequence increases on each sample.
+/* New samples use CLOCK_BOOTTIME; the sequence increases on each sample.
+ * GET_SAMPLE_SNAPSHOT returns -ENODATA before a sample and -EIO after an
+ * invalid active read. Neither error returns the cached sample.
  */
 struct akm09970_sample_snapshot {
 	__u64 timestamp_ns;

@@ -39,6 +39,7 @@ struct akm09970 {
 	struct mutex lock;
 	wait_queue_head_t waitq;
 	atomic_t data_ready;
+	atomic_t sample_error;
 	struct delayed_work initial_sample_work;
 	u8 chip_info[2];
 	u8 sample[AKM_SENSOR_DATA_SIZE];
@@ -71,11 +72,15 @@ static u8 akm09970_mode(u32 hz)
 	return AK09970_MODE_CONTINUOUS_10HZ;
 }
 
-static void akm09970_invalidate_sample_locked(struct akm09970 *sensor)
+static void akm09970_invalidate_sample_locked(struct akm09970 *sensor,
+					       bool error)
 {
 	sensor->sample_valid = false;
 	sensor->sample_timestamp_ns = 0;
 	atomic_set(&sensor->data_ready, 0);
+	atomic_set(&sensor->sample_error, error);
+	if (error)
+		wake_up_interruptible_poll(&sensor->waitq, EPOLLERR);
 }
 
 static int akm09970_power_on(struct akm09970 *sensor)
@@ -128,7 +133,7 @@ static int akm09970_activate_locked(struct akm09970 *sensor)
 	}
 
 	sensor->active = true;
-	akm09970_invalidate_sample_locked(sensor);
+	akm09970_invalidate_sample_locked(sensor, false);
 	mod_delayed_work(system_wq, &sensor->initial_sample_work,
 			 msecs_to_jiffies(20));
 	return 0;
@@ -143,7 +148,7 @@ static void akm09970_deactivate_locked(struct akm09970 *sensor)
 				  AK09970_MODE_POWERDOWN);
 	sensor->active = false;
 	cancel_delayed_work(&sensor->initial_sample_work);
-	akm09970_invalidate_sample_locked(sensor);
+	akm09970_invalidate_sample_locked(sensor, false);
 	akm09970_power_off(sensor);
 }
 
@@ -170,12 +175,13 @@ static void akm09970_read_sample_locked(struct akm09970 *sensor)
 	sensor->sample_timestamp_ns = ktime_get_boottime_ns();
 	sensor->sample_sequence++;
 	sensor->sample_valid = true;
+	atomic_set(&sensor->sample_error, 0);
 	atomic_set(&sensor->data_ready, 1);
 	wake_up_interruptible_poll(&sensor->waitq, EPOLLIN | EPOLLRDNORM);
 	return;
 
 invalid:
-	akm09970_invalidate_sample_locked(sensor);
+	akm09970_invalidate_sample_locked(sensor, true);
 }
 
 static void akm09970_initial_sample_work(struct work_struct *work)
@@ -236,6 +242,8 @@ static __poll_t akm09970_poll(struct file *file, poll_table *wait)
 	poll_wait(file, &sensor->waitq, wait);
 	if (READ_ONCE(sensor->removing))
 		return EPOLLHUP;
+	if (atomic_read(&sensor->sample_error))
+		return EPOLLERR;
 	if (atomic_xchg(&sensor->data_ready, 0))
 		return EPOLLIN | EPOLLRDNORM;
 
@@ -284,7 +292,7 @@ static long akm09970_ioctl(struct file *file, unsigned int cmd,
 			break;
 		}
 		sensor->measure_hz = payload.sensor_mode;
-		akm09970_invalidate_sample_locked(sensor);
+		akm09970_invalidate_sample_locked(sensor, false);
 		if (sensor->active)
 			ret = i2c_smbus_write_byte_data(sensor->client,
 					AK09970_REG_CNTL2,
@@ -297,7 +305,8 @@ static long akm09970_ioctl(struct file *file, unsigned int cmd,
 		break;
 	case AKM_IOC_GET_SAMPLE_SNAPSHOT:
 		if (!sensor->active || !sensor->sample_valid) {
-			ret = -ENODATA;
+			ret = atomic_read(&sensor->sample_error) ?
+				-EIO : -ENODATA;
 			break;
 		}
 		snapshot.timestamp_ns = sensor->sample_timestamp_ns;
@@ -373,6 +382,7 @@ static int akm09970_probe(struct i2c_client *client)
 	mutex_init(&sensor->lock);
 	init_waitqueue_head(&sensor->waitq);
 	atomic_set(&sensor->data_ready, 0);
+	atomic_set(&sensor->sample_error, 0);
 	INIT_DELAYED_WORK(&sensor->initial_sample_work,
 			  akm09970_initial_sample_work);
 	device_property_read_u32(dev, "asahi-kasei,measure-freq-hz", &measure_hz);
