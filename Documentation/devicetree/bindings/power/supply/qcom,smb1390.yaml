@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/qcom,smb1390.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Qualcomm SMB1390 auxiliary charge pump
+
+maintainers:
+  - snowf14k3 <60956553+snowf14k3@users.noreply.github.com>
+
+description: |
+  The SMB1390 is an I2C-controlled divide-by-two charge pump. The driver
+  exposes its fault state and die temperature. Enabling the pump requires
+  a coordinated charger and USB input policy.
+
+allOf:
+  - $ref: power-supply.yaml#
+
+properties:
+  compatible:
+    const: qcom,smb1390
+
+  reg:
+    maxItems: 1
+
+  io-channels:
+    maxItems: 1
+    description: PM8150B ADC channel connected to the SMB1390 die monitor
+
+  io-channel-names:
+    items:
+      - const: die-temp
+
+required:
+  - compatible
+  - reg
+  - io-channels
+  - io-channel-names
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/iio/qcom,spmi-vadc.h>
+
+    i2c {
+      #address-cells = <1>;
+      #size-cells = <0>;
+
+      charge-pump@10 {
+        compatible = "qcom,smb1390";
+        reg = <0x10>;
+        io-channels = <&pm8150b_adc ADC5_AMUX_THM2>;
+        io-channel-names = "die-temp";
+      };
+    };

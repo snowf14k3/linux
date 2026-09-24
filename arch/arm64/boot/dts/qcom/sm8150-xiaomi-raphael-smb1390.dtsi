@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Xiaomi Raphael SMB1390 charge pump hardware description.
+ * Board integration must enable i2c4 and the charge pump node together.
+ */
+
+#include <dt-bindings/iio/qcom,spmi-vadc.h>
+
+&pm8150b_adc {
+	channel@e {
+		reg = <ADC5_AMUX_THM2>;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
+		label = "smb1390_therm";
+	};
+};
+
+&i2c4 {
+	smb1390: charge-pump@10 {
+		compatible = "qcom,smb1390";
+		reg = <0x10>;
+		io-channels = <&pm8150b_adc ADC5_AMUX_THM2>;
+		io-channel-names = "die-temp";
+		status = "disabled";
+	};
+};
