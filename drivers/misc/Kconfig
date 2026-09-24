@@ -644,6 +644,23 @@ config MCHP_LAN966X_PCI
 	    - lan966x-miim (MDIO_MSCC_MIIM)
 	    - lan966x-switch (LAN966X_SWITCH)
 
+config TI_DRV8846
+	tristate "TI DRV8846 Raphael popup camera motor"
+	depends on OF && GPIOLIB && PWM
+	help
+	  Drive the Raphael popup camera stepper motor using a PM8150L PWM
+	  clock and DRV8846 GPIO controls. The driver exposes the downstream
+	  compatible /dev/drv8846_dev ioctl interface and enforces a bounded
+	  movement time with fault cutoff.
+
+config AKM09970
+	tristate "AK09970 Raphael popup camera Hall sensor"
+	depends on I2C && GPIOLIB
+	help
+	  Read the AK09970 Hall magnetic sensor on the Raphael popup camera.
+	  The driver exposes the downstream compatible /dev/akm09970 ioctl
+	  interface with raw sensor samples and poll notification.
+
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
 source "drivers/misc/cb710/Kconfig"

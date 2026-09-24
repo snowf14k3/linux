@@ -1,0 +1,96 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Raphael popup camera motor and AK09970 position sensor.
+ *
+ * The downstream PM8150L PWM channel 1 is PM8150L LPG channel 4 in the
+ * mainline LPG driver's five-channel numbering.
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
+
+/ {
+	popup_camera_motor: motor {
+		compatible = "ti,drv8846";
+		pwms = <&pm8150l_lpg 4 1000000>;
+
+		mode0-gpios = <&tlmm 21 GPIO_ACTIVE_HIGH>;
+		mode1-gpios = <&tlmm 33 GPIO_ACTIVE_HIGH>;
+		dir-gpios = <&tlmm 9 GPIO_ACTIVE_HIGH>;
+		sleep-gpios = <&tlmm 35 GPIO_ACTIVE_HIGH>;
+		enable-gpios = <&tlmm 130 GPIO_ACTIVE_HIGH>;
+		fault-gpios = <&tlmm 36 GPIO_ACTIVE_LOW>;
+
+		ti,rampup-period-ns = <625000>;
+		ti,rampup-duration-ms = <50>;
+		ti,high-period-ns = <52083>;
+		ti,high-duration-ms = <720>;
+		ti,rampdown-period-ns = <625000>;
+		ti,rampdown-duration-ms = <50>;
+		ti,step-mode = <2>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&motor_pwm_pin &motor_ctrl_pins &motor_fault_pin>;
+	};
+};
+
+&pm8150l_gpios {
+	motor_pwm_pin: motor-pwm-state {
+		pins = "gpio10";
+		function = PMIC_GPIO_FUNC_FUNC1;
+		power-source = <1>;
+		qcom,drive-strength = <PMIC_GPIO_STRENGTH_LOW>;
+		bias-disable;
+		drive-push-pull;
+		output-low;
+	};
+};
+
+&tlmm {
+	motor_ctrl_pins: motor-ctrl-state {
+		pins = "gpio9", "gpio21", "gpio33", "gpio35", "gpio130";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-low;
+	};
+
+	motor_fault_pin: motor-fault-state {
+		pins = "gpio36";
+		function = "gpio";
+		bias-pull-up;
+		input-enable;
+	};
+
+	hall_reset_pin: hall-reset-state {
+		pins = "gpio11";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-low;
+	};
+
+	hall_irq_pin: hall-irq-state {
+		pins = "gpio27";
+		function = "gpio";
+		bias-pull-up;
+		input-enable;
+	};
+};
+
+&i2c4 {
+	status = "okay";
+
+	hall_sensor: hall-sensor@c {
+		compatible = "asahi-kasei,ak09970";
+		reg = <0x0c>;
+		interrupts-extended = <&tlmm 27 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&tlmm 11 GPIO_ACTIVE_LOW>;
+		vdd-supply = <&vreg_l8c_1p8>;
+		asahi-kasei,measure-freq-hz = <100>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&hall_reset_pin &hall_irq_pin>;
+	};
+};
