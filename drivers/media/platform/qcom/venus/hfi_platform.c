@@ -92,6 +92,14 @@ hfi_platform_get_codecs(struct venus_core *core, u32 *enc_codecs,
 		*dec_codecs &= ~HFI_VIDEO_CODEC_VP8;
 	}
 
+	/*
+	 * The SM8150 IRIS1 firmware advertises MPEG-2 but stalls after the
+	 * initial source-change event and continuously asserts the Venus IRQ.
+	 * Do not expose a codec path which cannot return its first frame.
+	 */
+	if (IS_IRIS1(core))
+		*dec_codecs &= ~HFI_VIDEO_CODEC_MPEG2;
+
 	return 0;
 }
 
