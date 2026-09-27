@@ -32,7 +32,20 @@
 #define		GLOBAL_RESET_CMD_VFE_DOMAIN	BIT(30)
 #define		GLOBAL_RESET_CMD_RESET_BYPASS	BIT(31)
 
+#define VFE_MODULE_LENS_EN			(0x040)
+#define		LENS_DEMUX_EN			BIT(2)
+#define		LENS_DEMO_EN			BIT(10)
+#define VFE_MODULE_COLOR_EN			(0x048)
+#define VFE_MODULE_ZOOM_EN			(0x04c)
+#define		ZOOM_CST_EN			BIT(0)
+#define		ZOOM_SCALE_VID_EN		BIT(3)
+
 #define VFE_CORE_CFG				(0x050)
+#define		CFG_PIXEL_PATTERN_MASK		GENMASK(2, 0)
+#define		CFG_PIXEL_PATTERN_RGRGRG	(0x0)
+#define		CFG_PIXEL_PATTERN_GRGRGR	(0x1)
+#define		CFG_PIXEL_PATTERN_BGBGBG	(0x2)
+#define		CFG_PIXEL_PATTERN_GBGBGB	(0x3)
 #define		CFG_PIXEL_PATTERN_YCBYCR	(0x4)
 #define		CFG_PIXEL_PATTERN_YCRYCB	(0x5)
 #define		CFG_PIXEL_PATTERN_CBYCRY	(0x6)
@@ -92,6 +105,53 @@
 #define		CFG_BINNING_EN			BIT(9)
 #define		CFG_FRAME_BASED_EN		BIT(10)
 #define		CFG_RAW_CROP_EN			BIT(22)
+
+#define VFE_CAMIF_LINE_SKIP_PATTERN		(0x488)
+#define VFE_CAMIF_PIXEL_SKIP_PATTERN		(0x48c)
+#define VFE_CAMIF_SKIP_PERIOD			(0x490)
+#define VFE_CAMIF_IRQ_SUBSAMPLE_PATTERN		(0x49c)
+#define VFE_CAMIF_EPOCH_IRQ			(0x4a0)
+#define VFE_CAMIF_RAW_CROP_WIDTH_CFG		(0xce4)
+#define VFE_CAMIF_RAW_CROP_HEIGHT_CFG		(0xce8)
+
+#define VFE_DEMUX_CFG				(0x560)
+#define VFE_DEMUX_GAIN_0			(0x564)
+#define VFE_DEMUX_GAIN_1			(0x568)
+#define VFE_DEMUX_RIGHT_GAIN_0			(0x56c)
+#define VFE_DEMUX_RIGHT_GAIN_1			(0x570)
+#define VFE_DEMUX_EVEN_CFG			(0x574)
+#define VFE_DEMUX_ODD_CFG			(0x578)
+#define		DEMUX_UNITY_Q10			0x400
+
+#define VFE_DEMO_CFG				(0x6f8)
+#define VFE_DEMO_WB_LEFT_CFG_0			(0x6fc)
+#define VFE_DEMO_WB_LEFT_CFG_1			(0x700)
+#define VFE_DEMO_WB_LEFT_OFFSET_CFG_0		(0x704)
+#define VFE_DEMO_WB_LEFT_OFFSET_CFG_1		(0x708)
+#define VFE_DEMO_WB_RIGHT_CFG_0			(0x70c)
+#define VFE_DEMO_WB_RIGHT_CFG_1			(0x710)
+#define VFE_DEMO_WB_RIGHT_OFFSET_CFG_0		(0x714)
+#define VFE_DEMO_WB_RIGHT_OFFSET_CFG_1		(0x718)
+#define VFE_DEMO_INTERP_COEFF_CFG		(0x71c)
+#define VFE_DEMO_INTERP_CLASSIFIER_0		(0x720)
+#define		WB_UNITY_Q7			0x80
+
+#define VFE_SCALE_VID_Y_CFG			(0xa3c)
+#define VFE_SCALE_VID_C_CFG			(0xa68)
+#define		MNDS_HV_EN			(BIT(0) | BIT(1))
+#define		MNDS_INTERP_RESO		3
+#define		MNDS_PHASE_SHIFT		14
+
+#define VFE_FULL_Y_CROP_RND_CLAMP_CFG		(0xe0c)
+#define VFE_FULL_Y_CH0_CLAMP_CFG			(0xe18)
+#define VFE_FULL_Y_CH0_ROUNDING_CFG		(0xe1c)
+#define VFE_FULL_C_CROP_RND_CLAMP_CFG		(0xe2c)
+#define VFE_FULL_C_CH0_CLAMP_CFG			(0xe38)
+#define VFE_FULL_C_CH0_ROUNDING_CFG		(0xe3c)
+#define		FULL_ROUND_CLAMP_EN		(BIT(10) | BIT(11))
+#define		FULL_CLAMP_8BIT		(0xff << 20)
+#define		FULL_ROUND_10_TO_8		((3 << 1) | (2 << 3))
+#define VFE_COLOR_XFORM_BASE			(0xf30)
 
 #define VFE_REG_UPDATE_CMD			(0x4ac)
 #define		REG_UPDATE_CAMIF		BIT(0)
@@ -488,6 +548,179 @@ error:
 	return -EINVAL;
 }
 
+static void vfe_pix_configure_mnds(struct vfe_device *vfe,
+				   u32 width, u32 height)
+{
+	u32 h_in = width - 1, v_in = height - 1;
+	u32 h_chroma_out = width / 2 - 1;
+	u32 v_chroma_out = height / 2 - 1;
+	/* Q14 phases with interpolation resolution 3: Y 1:1, C 2:1. */
+	u32 phase_y = (MNDS_INTERP_RESO << 28) |
+		(1U << (MNDS_INTERP_RESO + MNDS_PHASE_SHIFT));
+	u32 phase_c = (MNDS_INTERP_RESO << 28) |
+		(1U << (MNDS_INTERP_RESO + MNDS_PHASE_SHIFT + 1));
+	u32 y_regs[] = {
+		MNDS_HV_EN, h_in | (h_in << 16), phase_y, 0, 0, h_in,
+		v_in | (v_in << 16), phase_y, 0, 0, v_in,
+	};
+	u32 c_regs[] = {
+		MNDS_HV_EN, h_in | (h_chroma_out << 16),
+		phase_c, 0, 0, h_in,
+		v_in | (v_chroma_out << 16), phase_c, 0, 0, v_in,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(y_regs); i++)
+		writel_relaxed(y_regs[i],
+			       vfe->base + VFE_SCALE_VID_Y_CFG + i * 4);
+	for (i = 0; i < ARRAY_SIZE(c_regs); i++)
+		writel_relaxed(c_regs[i],
+			       vfe->base + VFE_SCALE_VID_C_CFG + i * 4);
+}
+
+static void vfe_pix_configure_yuv(struct vfe_device *vfe,
+				   u32 width, u32 height)
+{
+	/* Full-range BT.601 RGB to YCbCr, fixed-point coefficients. */
+	static const u32 cst[] = {
+		0x00750259, 0x00000132, 0, 0x03ff0000,
+		0x01fe1eae, 0x00001f54, 0x02000000, 0x03ff0000,
+		0x1fad1e55, 0x000001fe, 0x02000000, 0x03ff0000,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cst); i++)
+		writel_relaxed(cst[i],
+			       vfe->base + VFE_COLOR_XFORM_BASE + i * 4);
+
+	writel_relaxed(FULL_ROUND_CLAMP_EN,
+		       vfe->base + VFE_FULL_Y_CROP_RND_CLAMP_CFG);
+	writel_relaxed(FULL_CLAMP_8BIT,
+		       vfe->base + VFE_FULL_Y_CH0_CLAMP_CFG);
+	writel_relaxed(FULL_ROUND_10_TO_8,
+		       vfe->base + VFE_FULL_Y_CH0_ROUNDING_CFG);
+	writel_relaxed(FULL_ROUND_CLAMP_EN,
+		       vfe->base + VFE_FULL_C_CROP_RND_CLAMP_CFG);
+	writel_relaxed(FULL_CLAMP_8BIT,
+		       vfe->base + VFE_FULL_C_CH0_CLAMP_CFG);
+	writel_relaxed(FULL_ROUND_10_TO_8 | BIT(0),
+		       vfe->base + VFE_FULL_C_CH0_ROUNDING_CFG);
+	vfe_pix_configure_mnds(vfe, width, height);
+	writel_relaxed(ZOOM_CST_EN | ZOOM_SCALE_VID_EN,
+		       vfe->base + VFE_MODULE_ZOOM_EN);
+}
+
+static int vfe_pix_configure_frontend(struct vfe_line *line)
+{
+	struct vfe_device *vfe = to_vfe(line);
+	const struct v4l2_mbus_framefmt *fmt =
+		&line->fmt[MSM_VFE_PAD_SINK];
+	const struct v4l2_pix_format_mplane *pix =
+		&line->video_out.active_fmt.fmt.pix_mp;
+	u32 core_cfg, pattern, even, odd;
+	u32 unity_gain = DEMUX_UNITY_Q10 |
+			 (DEMUX_UNITY_Q10 << 16);
+	u32 unity_wb = WB_UNITY_Q7 | (WB_UNITY_Q7 << 16);
+
+	/* The initial path has full-frame luma and 2x2 chroma subsampling. */
+	if (fmt->width < 2 || fmt->height < 2 ||
+	    fmt->width > 0x3fff || fmt->height > 0x3fff ||
+	    (fmt->width & 1) || (fmt->height & 1) ||
+	    pix->width != fmt->width || pix->height != fmt->height)
+		return -EINVAL;
+
+	switch (fmt->code) {
+	case MEDIA_BUS_FMT_SRGGB10_1X10:
+		pattern = CFG_PIXEL_PATTERN_RGRGRG;
+		even = 0xc9;
+		odd = 0xac;
+		break;
+	case MEDIA_BUS_FMT_SGRBG10_1X10:
+		pattern = CFG_PIXEL_PATTERN_GRGRGR;
+		even = 0x9c;
+		odd = 0xca;
+		break;
+	case MEDIA_BUS_FMT_SBGGR10_1X10:
+		pattern = CFG_PIXEL_PATTERN_BGBGBG;
+		even = 0xca;
+		odd = 0x9c;
+		break;
+	case MEDIA_BUS_FMT_SGBRG10_1X10:
+		pattern = CFG_PIXEL_PATTERN_GBGBGB;
+		even = 0xac;
+		odd = 0xc9;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	core_cfg = readl_relaxed(vfe->base + VFE_CORE_CFG);
+	core_cfg &= ~CFG_PIXEL_PATTERN_MASK;
+	writel_relaxed(core_cfg | pattern, vfe->base + VFE_CORE_CFG);
+
+	/* A neutral Bayer frontend until per-module tuning is available. */
+	writel_relaxed(1, vfe->base + VFE_DEMUX_CFG);
+	writel_relaxed(unity_gain, vfe->base + VFE_DEMUX_GAIN_0);
+	writel_relaxed(unity_gain, vfe->base + VFE_DEMUX_GAIN_1);
+	writel_relaxed(unity_gain, vfe->base + VFE_DEMUX_RIGHT_GAIN_0);
+	writel_relaxed(unity_gain, vfe->base + VFE_DEMUX_RIGHT_GAIN_1);
+	writel_relaxed(even, vfe->base + VFE_DEMUX_EVEN_CFG);
+	writel_relaxed(odd, vfe->base + VFE_DEMUX_ODD_CFG);
+	writel_relaxed(0, vfe->base + VFE_DEMO_CFG);
+	writel_relaxed(unity_wb, vfe->base + VFE_DEMO_WB_LEFT_CFG_0);
+	writel_relaxed(WB_UNITY_Q7, vfe->base + VFE_DEMO_WB_LEFT_CFG_1);
+	writel_relaxed(0, vfe->base + VFE_DEMO_WB_LEFT_OFFSET_CFG_0);
+	writel_relaxed(0, vfe->base + VFE_DEMO_WB_LEFT_OFFSET_CFG_1);
+	writel_relaxed(unity_wb, vfe->base + VFE_DEMO_WB_RIGHT_CFG_0);
+	writel_relaxed(WB_UNITY_Q7, vfe->base + VFE_DEMO_WB_RIGHT_CFG_1);
+	writel_relaxed(0, vfe->base + VFE_DEMO_WB_RIGHT_OFFSET_CFG_0);
+	writel_relaxed(0, vfe->base + VFE_DEMO_WB_RIGHT_OFFSET_CFG_1);
+	writel_relaxed(0x8000, vfe->base + VFE_DEMO_INTERP_COEFF_CFG);
+	writel_relaxed(0x08000066,
+		       vfe->base + VFE_DEMO_INTERP_CLASSIFIER_0);
+	writel_relaxed(LENS_DEMUX_EN | LENS_DEMO_EN,
+		       vfe->base + VFE_MODULE_LENS_EN);
+	writel_relaxed(0, vfe->base + VFE_MODULE_COLOR_EN);
+	vfe_pix_configure_yuv(vfe, fmt->width, fmt->height);
+
+	writel_relaxed(0, vfe->base + VFE_CAMIF_LINE_SKIP_PATTERN);
+	writel_relaxed(0, vfe->base + VFE_CAMIF_PIXEL_SKIP_PATTERN);
+	writel_relaxed(0xf0f, vfe->base + VFE_CAMIF_SKIP_PERIOD);
+	writel_relaxed(1, vfe->base + VFE_CAMIF_IRQ_SUBSAMPLE_PATTERN);
+	writel_relaxed(((fmt->height - 1) / 2) << 16 | 0x14,
+		       vfe->base + VFE_CAMIF_EPOCH_IRQ);
+	writel_relaxed(fmt->width - 1,
+		       vfe->base + VFE_CAMIF_RAW_CROP_WIDTH_CFG);
+	writel_relaxed(fmt->height - 1,
+		       vfe->base + VFE_CAMIF_RAW_CROP_HEIGHT_CFG);
+	writel_relaxed(CMD_CLEAR_CAMIF_STATUS, vfe->base + VFE_CAMIF_CMD);
+	/* Make the Bayer and crop settings visible before the write masters. */
+	wmb();
+
+	return 0;
+}
+
+static void vfe_pix_start_camif(struct vfe_line *line)
+{
+	struct vfe_device *vfe = to_vfe(line);
+	unsigned long flags;
+
+	spin_lock_irqsave(&vfe->output_lock, flags);
+	writel_relaxed(CFG_VFE_OUTPUT_EN | CFG_BUS_OUTPUT_EN |
+		       CFG_RAW_CROP_EN, vfe->base + VFE_CAMIF_CFG);
+	vfe_reg_update(vfe, line->id);
+	spin_unlock_irqrestore(&vfe->output_lock, flags);
+}
+
+static void vfe_pix_stop_camif(struct vfe_device *vfe)
+{
+	writel_relaxed(0, vfe->base + VFE_CAMIF_CFG);
+	writel_relaxed(0, vfe->base + VFE_MODULE_LENS_EN);
+	writel_relaxed(0, vfe->base + VFE_MODULE_COLOR_EN);
+	writel_relaxed(0, vfe->base + VFE_MODULE_ZOOM_EN);
+	readl_relaxed(vfe->base + VFE_CAMIF_CFG);
+}
+
 /*
  * vfe_enable - Enable streaming on VFE line
  * @line: VFE line
@@ -526,15 +759,26 @@ static int vfe_enable(struct vfe_line *line)
 	if (ret < 0)
 		goto error_get_output;
 
+	if (vfe_is_sm8150_pix(vfe, line->id)) {
+		ret = vfe_pix_configure_frontend(line);
+		if (ret < 0)
+			goto error_enable_output;
+	}
+
 	ret = vfe_enable_output_v2(line);
 	if (ret < 0)
 		goto error_enable_output;
+
+	if (vfe_is_sm8150_pix(vfe, line->id))
+		vfe_pix_start_camif(line);
 
 	vfe->was_streaming = 1;
 
 	return 0;
 
 error_enable_output:
+	if (vfe_is_sm8150_pix(vfe, line->id))
+		vfe_pix_stop_camif(vfe);
 	vfe_put_output(line);
 
 error_get_output:
@@ -545,6 +789,16 @@ error_get_output:
 	mutex_unlock(&vfe->stream_lock);
 
 	return ret;
+}
+
+static int vfe_disable_17x(struct vfe_line *line)
+{
+	struct vfe_device *vfe = to_vfe(line);
+
+	if (vfe_is_sm8150_pix(vfe, line->id))
+		vfe_pix_stop_camif(vfe);
+
+	return vfe_disable(line);
 }
 
 /*
@@ -666,7 +920,7 @@ const struct vfe_hw_ops vfe_ops_170 = {
 	.reg_update_clear = vfe_reg_update_clear,
 	.reg_update = vfe_reg_update,
 	.subdev_init = vfe_subdev_init,
-	.vfe_disable = vfe_disable,
+	.vfe_disable = vfe_disable_17x,
 	.vfe_enable = vfe_enable,
 	.vfe_halt = vfe_halt,
 	.violation_read = vfe_violation_read,

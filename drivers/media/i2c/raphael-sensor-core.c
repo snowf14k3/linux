@@ -210,10 +210,13 @@ static int raphael_sensor_set_ctrl(struct v4l2_ctrl *ctrl)
 		u32 max = sensor->mode->height + ctrl->val -
 			  variant->exposure_margin;
 
-		__v4l2_ctrl_modify_range(sensor->exposure,
-					 sensor->exposure->minimum, max, 1,
-					 min_t(u32, sensor->exposure->default_value,
-					       max));
+		ret = __v4l2_ctrl_modify_range(sensor->exposure,
+					       sensor->exposure->minimum, max, 1,
+					       min_t(u32,
+						     sensor->exposure->default_value,
+						     max));
+		if (ret)
+			return ret;
 	}
 
 	ret = pm_runtime_get_if_in_use(sensor->dev);

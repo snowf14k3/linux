@@ -362,21 +362,18 @@ static int v4l2_async_match_notify(struct v4l2_async_notifier *notifier,
 		goto err_unregister_subdev;
 	}
 
-	if (registered) {
-		/*
-		 * Depending of the function of the entities involved, we may
-		 * want to create links between them (for example between a
-		 * sensor and its lens or between a sensor's source pad and the
-		 * connected device's sink pad).
-		 */
-		ret = v4l2_async_create_ancillary_links(notifier, sd);
-		if (ret) {
-			if (asc->match.type == V4L2_ASYNC_MATCH_TYPE_FWNODE)
-				dev_dbg(notifier_dev(notifier),
-					"failed creating links for %pfw (%d)\n",
-					asc->match.fwnode, ret);
-			goto err_call_unbind;
-		}
+	/*
+	 * A lens or flash can be shared by multiple sensors. Create the
+	 * ancillary link for each binding, including those that reuse an
+	 * already registered sub-device.
+	 */
+	ret = v4l2_async_create_ancillary_links(notifier, sd);
+	if (ret) {
+		if (asc->match.type == V4L2_ASYNC_MATCH_TYPE_FWNODE)
+			dev_dbg(notifier_dev(notifier),
+				"failed creating links for %pfw (%d)\n",
+				asc->match.fwnode, ret);
+		goto err_call_unbind;
 	}
 
 	list_add(&asc->asc_subdev_entry, &sd->asc_list);
@@ -392,7 +389,6 @@ static int v4l2_async_match_notify(struct v4l2_async_notifier *notifier,
 
 err_call_unbind:
 	v4l2_async_nf_call_unbind(notifier, sd, asc);
-	list_del(&asc->asc_subdev_entry);
 
 err_unregister_subdev:
 	if (registered)
@@ -504,16 +500,20 @@ v4l2_async_nf_unbind_all_subdevs(struct v4l2_async_notifier *notifier)
 /* See if an async sub-device can be found in a notifier's lists. */
 static bool
 v4l2_async_nf_has_async_match_entry(struct v4l2_async_notifier *notifier,
-				    struct v4l2_async_match_desc *match)
+				    struct v4l2_async_connection *candidate)
 {
 	struct v4l2_async_connection *asc;
 
 	list_for_each_entry(asc, &notifier->waiting_list, asc_entry)
-		if (v4l2_async_match_equal(&asc->match, match))
+		if (v4l2_async_match_equal(&asc->match, &candidate->match) &&
+		    !(asc->allow_shared && candidate->allow_shared &&
+		      notifier->sd && candidate->notifier->sd))
 			return true;
 
 	list_for_each_entry(asc, &notifier->done_list, asc_entry)
-		if (v4l2_async_match_equal(&asc->match, match))
+		if (v4l2_async_match_equal(&asc->match, &candidate->match) &&
+		    !(asc->allow_shared && candidate->allow_shared &&
+		      notifier->sd && candidate->notifier->sd))
 			return true;
 
 	return false;
@@ -525,8 +525,9 @@ v4l2_async_nf_has_async_match_entry(struct v4l2_async_notifier *notifier,
  */
 static bool
 v4l2_async_nf_has_async_match(struct v4l2_async_notifier *notifier,
-			      struct v4l2_async_match_desc *match)
+			      struct v4l2_async_connection *candidate)
 {
+	struct v4l2_async_match_desc *match = &candidate->match;
 	struct list_head *heads[] = {
 		&notifier->waiting_list,
 		&notifier->done_list,
@@ -547,23 +548,24 @@ v4l2_async_nf_has_async_match(struct v4l2_async_notifier *notifier,
 		}
 	}
 
-	/* Check that an asc does not exist in other notifiers. */
+	/* Only sensor ancillary references may be shared across notifiers. */
 	list_for_each_entry(notifier, &notifier_list, notifier_entry)
-		if (v4l2_async_nf_has_async_match_entry(notifier, match))
+		if (v4l2_async_nf_has_async_match_entry(notifier, candidate))
 			return true;
 
 	return false;
 }
 
 static int v4l2_async_nf_match_valid(struct v4l2_async_notifier *notifier,
-				     struct v4l2_async_match_desc *match)
+				     struct v4l2_async_connection *asc)
 {
+	struct v4l2_async_match_desc *match = &asc->match;
 	struct device *dev = notifier_dev(notifier);
 
 	switch (match->type) {
 	case V4L2_ASYNC_MATCH_TYPE_I2C:
 	case V4L2_ASYNC_MATCH_TYPE_FWNODE:
-		if (v4l2_async_nf_has_async_match(notifier, match)) {
+		if (v4l2_async_nf_has_async_match(notifier, asc)) {
 			dev_dbg(dev, "v4l2-async: match descriptor already listed in a notifier\n");
 			return -EEXIST;
 		}
@@ -605,7 +607,7 @@ static int __v4l2_async_nf_register(struct v4l2_async_notifier *notifier)
 	mutex_lock(&list_lock);
 
 	list_for_each_entry(asc, &notifier->waiting_list, asc_entry) {
-		ret = v4l2_async_nf_match_valid(notifier, &asc->match);
+		ret = v4l2_async_nf_match_valid(notifier, asc);
 		if (ret)
 			goto err_unlock;
 	}

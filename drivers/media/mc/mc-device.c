@@ -589,6 +589,21 @@ static void __media_device_unregister_entity(struct media_entity *entity)
 		}
 	}
 
+	/*
+	 * Ancillary links are owned by the primary entity, not the lens or
+	 * flash they point to. Remove inbound links before the ancillary
+	 * entity's graph object is destroyed.
+	 */
+	list_for_each_entry_safe(link, tmp, &mdev->links, graph_obj.list) {
+		if ((link->flags & MEDIA_LNK_FL_LINK_TYPE) !=
+		    MEDIA_LNK_FL_ANCILLARY_LINK ||
+		    link->gobj1 != &entity->graph_obj)
+			continue;
+		list_del(&link->list);
+		media_gobj_destroy(&link->graph_obj);
+		kfree(link);
+	}
+
 	/* Remove all data links that belong to this entity */
 	__media_entity_remove_links(entity);
 

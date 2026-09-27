@@ -5,8 +5,8 @@
  * sensor RAW paths, their lenses and read-only calibration EEPROMs.
  *
  * The front camera must be raised separately before capture; this device tree
- * does not provide an automatic motor/Hall interlock. VFE PIX/ISP output is
- * still hidden by the SM8150 CAMSS driver.
+ * does not provide an automatic motor/Hall interlock. Full VFE PIX output is
+ * exposed for evaluation, but its image quality and capture are unverified.
  */
 #include "sm8150-xiaomi-raphael.dts"
 

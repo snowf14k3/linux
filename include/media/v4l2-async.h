@@ -71,6 +71,7 @@ struct v4l2_async_match_desc {
  *		notifier @waiting_list or @done_list
  * @asc_subdev_entry:	entry in struct v4l2_async_subdev.asc_list list
  * @sd:		the related sub-device
+ * @allow_shared:	allow a lens or flash reference from multiple sensor notifiers
  *
  * When this struct is used as a member in a driver specific struct, the driver
  * specific struct shall contain the &struct v4l2_async_connection as its first
@@ -82,6 +83,7 @@ struct v4l2_async_connection {
 	struct list_head asc_entry;
 	struct list_head asc_subdev_entry;
 	struct v4l2_subdev *sd;
+	bool allow_shared;
 };
 
 /**

@@ -1835,7 +1835,7 @@ static const struct camss_subdev_resources vfe_res_8150[] = {
 		.vfe = {
 			.has_pd = true,
 			.pd_name = "ife0",
-			.line_num = 3,
+			.line_num = 4,
 			.hw_ops = &vfe_ops_170,
 			.formats_rdi = &vfe_formats_rdi_845,
 			.formats_pix = &vfe_formats_pix_8150,
@@ -1857,7 +1857,7 @@ static const struct camss_subdev_resources vfe_res_8150[] = {
 		.vfe = {
 			.has_pd = true,
 			.pd_name = "ife1",
-			.line_num = 3,
+			.line_num = 4,
 			.hw_ops = &vfe_ops_170,
 			.formats_rdi = &vfe_formats_rdi_845,
 			.formats_pix = &vfe_formats_pix_8150,
@@ -4855,14 +4855,14 @@ static int camss_link_entities(struct camss *camss)
 					struct v4l2_subdev *vfe = &camss->vfe[k].line[j].subdev;
 
 					/*
-					 * SM8150 full CSIDs have three RDIs; their fourth
-					 * path is PIX. Until full VFE PIX is implemented,
-					 * only same-index Lite RDI3 links are exposed;
-					 * Lite slot 3 selects CSI virtual channel 3.
+					 * On SM8150, full CSID pad 3 is IPP and full
+					 * VFE line 3 is PIX. Lite pad/line 3 is RDI3.
+					 * Both fourth paths connect only to the VFE
+					 * with the same hardware index.
 					 */
 					if (camss->res->version == CAMSS_8150 &&
 					    j == VFE_LINE_PIX &&
-					    (!camss->csid[i].res->is_lite || i != k))
+					    i != k)
 						continue;
 
 					ret = media_create_pad_link(&csid->entity,

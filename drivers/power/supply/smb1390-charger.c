@@ -1050,9 +1050,19 @@ static void smb1390_policy_work(struct work_struct *work)
 	}
 
 schedule:
-	if (READ_ONCE(chip->policy_enabled))
+	if (READ_ONCE(chip->policy_enabled)) {
 		mod_delayed_work(system_wq, &chip->policy_work,
 				 msecs_to_jiffies(delay_ms));
+		/*
+		 * A fault IRQ can race with the periodic rearm above. Preserve
+		 * its immediate rollback request, but do not spin if rollback
+		 * already failed and left PPS ownership pending.
+		 */
+		if (READ_ONCE(chip->irq_faulted) &&
+		    (chip->policy_active || chip->pps_owned) &&
+		    !chip->policy_faulted)
+			mod_delayed_work(system_wq, &chip->policy_work, 0);
+	}
 unlock:
 	mutex_unlock(&chip->policy_lock);
 }

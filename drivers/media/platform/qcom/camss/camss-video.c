@@ -7,6 +7,7 @@
  * Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  * Copyright (C) 2015-2018 Linaro Ltd.
  */
+#include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <media/media-entity.h>
 #include <media/v4l2-dev.h>
@@ -143,6 +144,31 @@ static int video_queue_setup(struct vb2_queue *q,
 	return 0;
 }
 
+static bool video_plane_dma_contiguous(struct sg_table *sgt, size_t size)
+{
+	struct scatterlist *sg;
+	u64 first, next;
+	unsigned int i;
+
+	if (!sgt || !sgt->nents || !size)
+		return false;
+
+	first = sg_dma_address(sgt->sgl);
+	if (first > 0xffffffffULL || size > 0x100000000ULL - first)
+		return false;
+
+	next = first;
+	for_each_sg(sgt->sgl, sg, sgt->nents, i) {
+		if ((u64)sg_dma_address(sg) != next || !sg_dma_len(sg))
+			return false;
+		next += sg_dma_len(sg);
+		if (next - first >= size)
+			return true;
+	}
+
+	return false;
+}
+
 static int video_buf_init(struct vb2_buffer *vb)
 {
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
@@ -156,8 +182,12 @@ static int video_buf_init(struct vb2_buffer *vb)
 
 	for (i = 0; i < format->num_planes; i++) {
 		sgt = vb2_dma_sg_plane_desc(vb, i);
-		if (!sgt)
-			return -EFAULT;
+		if (!video_plane_dma_contiguous(sgt,
+						format->plane_fmt[i].sizeimage)) {
+			dev_err_ratelimited(video->camss->dev,
+				"camera buffer needs contiguous 32-bit DMA space\n");
+			return -EINVAL;
+		}
 
 		buffer->addr[i] = sg_dma_address(sgt->sgl);
 	}

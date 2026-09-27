@@ -900,6 +900,7 @@ static int v4l2_fwnode_reference_parse(struct device *dev,
 
 			return PTR_ERR(asd);
 		}
+		asd->allow_shared = true;
 	}
 
 	/* -ENOENT here means successful parsing */
@@ -1206,6 +1207,7 @@ v4l2_fwnode_reference_parse_int_props(struct device *dev,
 
 			return PTR_ERR(asd);
 		}
+		asd->allow_shared = true;
 	}
 
 	return !fwnode || PTR_ERR(fwnode) == -ENOENT ? 0 : PTR_ERR(fwnode);
