@@ -615,9 +615,14 @@ static int qcom_vadc_scale_hw_smb_temp(
 				const struct adc5_data *data,
 				u16 adc_code, int *result_mdec)
 {
-	*result_mdec = qcom_vadc_scale_code_voltage_factor(adc_code * 100,
-				prescale, data, PMIC5_SMB_TEMP_SCALE_FACTOR);
-	*result_mdec = PMIC5_SMB_TEMP_CONSTANT - *result_mdec;
+	int voltage_uv;
+
+	/* Keep the ADC code unscaled until after the 16-bit input boundary. */
+	voltage_uv = qcom_vadc_scale_code_voltage_factor(adc_code,
+						      prescale, data, 1);
+	*result_mdec = PMIC5_SMB_TEMP_CONSTANT -
+		div_s64((s64)voltage_uv * 100,
+			PMIC5_SMB_TEMP_SCALE_FACTOR);
 
 	return 0;
 }

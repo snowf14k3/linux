@@ -1153,14 +1153,14 @@ config CHARGER_QCOM_SMB2
 	  in PMI8998 and related PMICs.
 
 config CHARGER_QCOM_SMB1390
-	tristate "Qualcomm SMB1390 charge pump diagnostics"
+	tristate "Qualcomm SMB1390 charge pump"
 	depends on I2C && IIO && CHARGER_QCOM_SMB2
 	select REGMAP_I2C
 	help
-	  Enable the SMB1390 I2C charge pump diagnostics interface. The
-	  driver reads die temperature and fault state and keeps the charge
-	  pump switcher disabled. A coordinated charger and USB input policy
-	  is required before the charge pump can be used for charging.
+	  Enable the SMB1390 I2C charge pump driver. It reports die temperature
+	  and faults, and keeps the switcher disabled unless an explicit
+	  board policy coordinates the main charger, PPS input and thermal
+	  conditions.
 
 config FUEL_GAUGE_MM8013
 	tristate "Mitsumi MM8013 fuel gauge driver"

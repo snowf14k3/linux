@@ -222,7 +222,7 @@ static int raphael_sensor_set_ctrl(struct v4l2_ctrl *ctrl)
 
 	ret = raphael_write_list(sensor, &variant->group_hold_on);
 	if (ret)
-		goto put_pm;
+		goto release_group;
 
 	switch (ctrl->id) {
 	case V4L2_CID_VBLANK:
@@ -250,6 +250,7 @@ static int raphael_sensor_set_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	}
 
+release_group:
 	{
 		int release_ret = raphael_write_list(sensor,
 						     &variant->group_hold_off);

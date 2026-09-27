@@ -60,6 +60,25 @@ properties:
       inactive during probe until a coordinated charging policy owns it.
     type: boolean
 
+  qcom,primary-charge-current-limit-microamp:
+    description: |
+      Maximum battery charge current while the secondary charge pump is not
+      under the coordinated policy. The pump policy may request a higher
+      current up to the monitored battery limit only through the internal
+      charger handoff API.
+    minimum: 50000
+    maximum: 5100000
+    multipleOf: 50000
+
+  qcom,primary-input-current-limit-microamp:
+    description: |
+      USB input current ceiling for ordinary charging. A coordinated charge
+      pump policy can request up to input-current-limit-microamp through the
+      internal charger handoff API after validating PPS and the USB input.
+    minimum: 50000
+    maximum: 4800000
+    multipleOf: 50000
+
 required:
   - compatible
   - reg
@@ -72,6 +91,13 @@ required:
 allOf:
   - $ref: power-supply.yaml#
   - if:
+      required:
+        - qcom,secondary-charger-present
+    then:
+      required:
+        - qcom,primary-charge-current-limit-microamp
+        - qcom,primary-input-current-limit-microamp
+  - if:
       properties:
         compatible:
           contains:
@@ -81,6 +107,8 @@ allOf:
         input-current-limit-microamp:
           maximum: 3000000
         qcom,secondary-charger-present: false
+        qcom,primary-charge-current-limit-microamp: false
+        qcom,primary-input-current-limit-microamp: false
   - if:
       properties:
         compatible:
@@ -92,6 +120,8 @@ allOf:
       properties:
         input-current-limit-microamp: false
         qcom,secondary-charger-present: false
+        qcom,primary-charge-current-limit-microamp: false
+        qcom,primary-input-current-limit-microamp: false
 
 additionalProperties: false
 

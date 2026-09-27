@@ -270,9 +270,14 @@ struct smb_chip {
 	u32 current_step_ua;
 	u32 fast_charge_current_cap_ua;
 	u32 input_current_limit_ua;
+	u32 primary_input_limit_ua;
+	u32 primary_fcc_limit_ua;
 	bool fcc_limit_to_battery;
 	bool secondary_present;
+	bool cp_active;
+	bool cp_input_owned;
 	struct mutex input_lock;
+	struct mutex auto_icl_lock;
 	bool input_config_failed;
 	bool input_ready;
 
@@ -557,7 +562,53 @@ static int smb_get_fast_charge_current_max(struct smb_chip *chip, int *val)
 
 	*val = min_t(int, chip->batt_info->constant_charge_current_max_ua,
 		     chip->fast_charge_current_cap_ua);
+	if (chip->primary_fcc_limit_ua)
+		*val = min_t(int, *val, chip->primary_fcc_limit_ua);
 	return 0;
+}
+
+static int smb_get_charge_pump_fcc_max(struct smb_chip *chip, int *val)
+{
+	if (!chip->secondary_present || !chip->primary_fcc_limit_ua)
+		return -EOPNOTSUPP;
+	if (!chip->batt_info ||
+	    chip->batt_info->constant_charge_current_max_ua <= 0)
+		return -EAGAIN;
+
+	*val = min_t(int, chip->batt_info->constant_charge_current_max_ua,
+		     chip->fast_charge_current_cap_ua);
+	return 0;
+}
+
+static int smb_restore_primary_fcc(struct smb_chip *chip)
+{
+	unsigned int current;
+	int max_ua, ret;
+
+	ret = smb_get_fast_charge_current_max(chip, &max_ua);
+	if (ret)
+		return ret;
+	ret = regmap_read(chip->regmap,
+			  chip->base + FAST_CHARGE_CURRENT_CFG, &current);
+	if (ret)
+		return ret;
+	if ((current & FAST_CHARGE_CURRENT_SETTING_MASK) *
+	    chip->current_step_ua <= max_ua)
+		return 0;
+
+	ret = regmap_update_bits(chip->regmap,
+				 chip->base + FAST_CHARGE_CURRENT_CFG,
+				 FAST_CHARGE_CURRENT_SETTING_MASK,
+				 max_ua / chip->current_step_ua);
+	if (ret)
+		return ret;
+	ret = regmap_read(chip->regmap,
+			  chip->base + FAST_CHARGE_CURRENT_CFG, &current);
+	if (ret)
+		return ret;
+
+	return (current & FAST_CHARGE_CURRENT_SETTING_MASK) *
+		chip->current_step_ua <= max_ua ? 0 : -EIO;
 }
 
 static int smb_set_fast_charge_current(struct smb_chip *chip, int val)
@@ -732,6 +783,9 @@ static int smb_set_current_limit_request(struct smb_chip *chip,
 {
 	bool ready;
 
+	if (chip->primary_input_limit_ua &&
+	    val > chip->primary_input_limit_ua)
+		return -EINVAL;
 	if (chip->input_current_limit_ua) {
 		mutex_lock(&chip->input_lock);
 		ready = chip->input_ready;
@@ -793,8 +847,17 @@ static void smb_status_change_work(struct work_struct *work)
 
 	if (chip->input_current_limit_ua)
 		current_ua = min(current_ua, chip->input_current_limit_ua);
+	if (chip->primary_input_limit_ua)
+		current_ua = min(current_ua, chip->primary_input_limit_ua);
 
+	/* Do not overwrite an input limit owned by the PPS pump policy. */
+	mutex_lock(&chip->auto_icl_lock);
+	if (READ_ONCE(chip->cp_input_owned)) {
+		mutex_unlock(&chip->auto_icl_lock);
+		return;
+	}
 	rc = smb_set_current_limit_request(chip, current_ua);
+	mutex_unlock(&chip->auto_icl_lock);
 	if (rc < 0) {
 		dev_err(chip->dev, "failed to set USB input current limit: %d\n",
 			rc);
@@ -1420,7 +1483,7 @@ static int smb_set_charge_pump_hw(struct smb_chip *chip, bool enable)
 int qcom_smbx_set_charge_pump(struct power_supply *main_psy, bool enable)
 {
 	struct smb_chip *chip;
-	int online, ret;
+	int fcc_ret = 0, online, ret;
 
 	if (!main_psy || !main_psy->desc ||
 	    main_psy->desc->get_property != smb_get_property)
@@ -1431,6 +1494,11 @@ int qcom_smbx_set_charge_pump(struct power_supply *main_psy, bool enable)
 
 	mutex_lock(&chip->input_lock);
 	if (enable) {
+		if (!chip->primary_fcc_limit_ua ||
+		    !chip->primary_input_limit_ua) {
+			ret = -EOPNOTSUPP;
+			goto unlock;
+		}
 		if (!chip->input_ready || chip->input_config_failed) {
 			ret = chip->input_config_failed ? -EIO : -EAGAIN;
 			goto unlock;
@@ -1442,12 +1510,19 @@ int qcom_smbx_set_charge_pump(struct power_supply *main_psy, bool enable)
 			ret = -ENODEV;
 			goto unlock;
 		}
+	} else {
+		/* Drop to the standalone charger limit before releasing SMB_EN. */
+		fcc_ret = smb_restore_primary_fcc(chip);
 	}
 
 	ret = smb_set_charge_pump_hw(chip, enable);
+	if (fcc_ret && !ret)
+		ret = fcc_ret;
 	if (ret) {
 		int off_ret = smb_prepare_secondary_charger(chip);
 
+		WRITE_ONCE(chip->cp_active, false);
+		WRITE_ONCE(chip->cp_input_owned, false);
 		dev_err(chip->dev,
 			"secondary charger handoff failed: %d; suspending USB\n",
 			ret);
@@ -1455,6 +1530,10 @@ int qcom_smbx_set_charge_pump(struct power_supply *main_psy, bool enable)
 			dev_err(chip->dev, "failed to force SMB_EN low: %d\n",
 				off_ret);
 		smb_capped_input_fault(chip);
+	} else {
+		WRITE_ONCE(chip->cp_active, enable);
+		if (!enable)
+			WRITE_ONCE(chip->cp_input_owned, false);
 	}
 unlock:
 	mutex_unlock(&chip->input_lock);
@@ -1463,6 +1542,134 @@ unlock:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(qcom_smbx_set_charge_pump);
+
+int qcom_smbx_set_charge_pump_input_limit(struct power_supply *main_psy,
+						 int ua)
+{
+	struct smb_chip *chip;
+	int ret;
+
+	if (!main_psy || !main_psy->desc ||
+	    main_psy->desc->get_property != smb_get_property)
+		return -EINVAL;
+	chip = power_supply_get_drvdata(main_psy);
+	if (!chip || chip->chg_psy != main_psy ||
+	    !chip->secondary_present || !chip->primary_input_limit_ua)
+		return -ENODEV;
+	if (ua < chip->current_step_ua ||
+	    ua > chip->input_current_limit_ua ||
+	    ua % chip->current_step_ua)
+		return -EINVAL;
+	if (!READ_ONCE(chip->input_ready) ||
+	    READ_ONCE(chip->input_config_failed))
+		return -EAGAIN;
+
+	/* Serialize this handoff with the ordinary APSD current update. */
+	mutex_lock(&chip->auto_icl_lock);
+	ret = smb_set_current_limit(chip, ua, true);
+	WRITE_ONCE(chip->cp_input_owned, !ret);
+	mutex_unlock(&chip->auto_icl_lock);
+	if (!ret)
+		power_supply_changed(chip->chg_psy);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(qcom_smbx_set_charge_pump_input_limit);
+
+int qcom_smbx_get_charge_pump_fcc_max(struct power_supply *main_psy,
+					     int *max_ua)
+{
+	struct smb_chip *chip;
+	int ret;
+
+	if (!max_ua || !main_psy || !main_psy->desc ||
+	    main_psy->desc->get_property != smb_get_property)
+		return -EINVAL;
+	chip = power_supply_get_drvdata(main_psy);
+	if (!chip || chip->chg_psy != main_psy)
+		return -ENODEV;
+
+	mutex_lock(&chip->input_lock);
+	if (!chip->cp_active || !chip->input_ready ||
+	    chip->input_config_failed)
+		ret = -EAGAIN;
+	else
+		ret = smb_get_charge_pump_fcc_max(chip, max_ua);
+	mutex_unlock(&chip->input_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(qcom_smbx_get_charge_pump_fcc_max);
+
+int qcom_smbx_set_charge_pump_fcc(struct power_supply *main_psy, int ua)
+{
+	struct smb_chip *chip;
+	unsigned int cfg, cmd, readback;
+	int max_ua, off_ret, online, ret;
+
+	if (!main_psy || !main_psy->desc ||
+	    main_psy->desc->get_property != smb_get_property)
+		return -EINVAL;
+	chip = power_supply_get_drvdata(main_psy);
+	if (!chip || chip->chg_psy != main_psy)
+		return -ENODEV;
+
+	mutex_lock(&chip->input_lock);
+	if (!chip->cp_active || !chip->input_ready ||
+	    chip->input_config_failed) {
+		ret = -EAGAIN;
+		goto unlock_fcc;
+	}
+	ret = smb_get_charge_pump_fcc_max(chip, &max_ua);
+	if (ret)
+		goto unlock_fcc;
+	if (ua <= 0 || ua > max_ua || ua % chip->current_step_ua) {
+		ret = -EINVAL;
+		goto unlock_fcc;
+	}
+	ret = smb_get_prop_usb_online(chip, &online);
+	if (ret || !online) {
+		ret = ret ? ret : -ENODEV;
+		goto unlock_fcc;
+	}
+	ret = regmap_read(chip->regmap, chip->base + MISC_SMB_EN_CMD, &cmd);
+	if (!ret)
+		ret = regmap_read(chip->regmap, chip->base + MISC_SMB_CFG,
+				  &cfg);
+	if (!ret && ((cmd & (SMB_EN_OVERRIDE_BIT |
+				  SMB_EN_OVERRIDE_VALUE_BIT |
+				  EN_CP_CMD_BIT)) != EN_CP_CMD_BIT ||
+		     !(cfg & SMB_EN_SEL_BIT)))
+		ret = -EIO;
+	if (ret)
+		goto fault_fcc;
+
+	ret = regmap_update_bits(chip->regmap,
+				 chip->base + FAST_CHARGE_CURRENT_CFG,
+				 FAST_CHARGE_CURRENT_SETTING_MASK,
+				 ua / chip->current_step_ua);
+	if (!ret)
+		ret = regmap_read(chip->regmap,
+				  chip->base + FAST_CHARGE_CURRENT_CFG, &readback);
+	if (!ret && (readback & FAST_CHARGE_CURRENT_SETTING_MASK) !=
+	    ua / chip->current_step_ua)
+		ret = -EIO;
+	if (ret)
+		goto fault_fcc;
+	goto unlock_fcc;
+fault_fcc:
+	off_ret = smb_prepare_secondary_charger(chip);
+	WRITE_ONCE(chip->cp_active, false);
+	if (off_ret)
+		dev_err(chip->dev,
+			"failed to hold SMB_EN low after FCC error: %d\n",
+			off_ret);
+	smb_capped_input_fault(chip);
+unlock_fcc:
+	mutex_unlock(&chip->input_lock);
+	if (!ret)
+		power_supply_changed(chip->chg_psy);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(qcom_smbx_set_charge_pump_fcc);
 
 static void smb_put_battery_info(void *data)
 {
@@ -1517,6 +1724,24 @@ static int smb_probe(struct platform_device *pdev)
 	    FAST_CHARGE_CURRENT_SETTING_MASK * chip->current_step_ua)
 		return dev_err_probe(chip->dev, -EINVAL,
 				     "invalid fast charge current cap\n");
+	if (device_property_present(chip->dev,
+				    "qcom,primary-charge-current-limit-microamp")) {
+		if (!chip->secondary_present || !match_data->limit_fcc_to_battery)
+			return dev_err_probe(chip->dev, -EINVAL,
+					     "primary FCC cap needs a secondary charger\n");
+		rc = device_property_read_u32(chip->dev,
+				"qcom,primary-charge-current-limit-microamp",
+				&chip->primary_fcc_limit_ua);
+		if (rc)
+			return dev_err_probe(chip->dev, rc,
+					     "invalid primary FCC cap\n");
+		if (chip->primary_fcc_limit_ua < chip->current_step_ua ||
+		    chip->primary_fcc_limit_ua >
+		    chip->fast_charge_current_cap_ua ||
+		    chip->primary_fcc_limit_ua % chip->current_step_ua)
+			return dev_err_probe(chip->dev, -EINVAL,
+					     "primary FCC cap out of range\n");
+	}
 
 	/* Shut down PM8150B battery charging before any later probe failure. */
 	if (match_data->limit_fcc_to_battery) {
@@ -1568,6 +1793,24 @@ static int smb_probe(struct platform_device *pdev)
 			return dev_err_probe(chip->dev, -EINVAL,
 					     "USB input current cap out of range\n");
 	}
+	if (device_property_present(chip->dev,
+				    "qcom,primary-input-current-limit-microamp")) {
+		if (!chip->secondary_present || !chip->input_current_limit_ua)
+			return dev_err_probe(chip->dev, -EINVAL,
+					     "primary input cap needs secondary charger\n");
+		rc = device_property_read_u32(chip->dev,
+				"qcom,primary-input-current-limit-microamp",
+				&chip->primary_input_limit_ua);
+		if (rc)
+			return dev_err_probe(chip->dev, rc,
+					     "invalid primary input cap\n");
+		if (chip->primary_input_limit_ua < chip->current_step_ua ||
+		    chip->primary_input_limit_ua >
+		    chip->input_current_limit_ua ||
+		    chip->primary_input_limit_ua % chip->current_step_ua)
+			return dev_err_probe(chip->dev, -EINVAL,
+					     "primary input cap out of range\n");
+	}
 
 	/* Other SMB5 models need the same fallback when the cap is opted in. */
 	if (chip->input_current_limit_ua &&
@@ -1578,6 +1821,7 @@ static int smb_probe(struct platform_device *pdev)
 	}
 
 	mutex_init(&chip->input_lock);
+	mutex_init(&chip->auto_icl_lock);
 	if (chip->input_current_limit_ua) {
 		rc = smb_set_usb_suspend(chip, true);
 		if (rc)
@@ -1638,11 +1882,19 @@ static int smb_probe(struct platform_device *pdev)
 	    chip->batt_info->constant_charge_current_max_ua <= 0)
 		return dev_err_probe(chip->dev, -EINVAL,
 				     "invalid battery charge current limit\n");
+	if (chip->primary_fcc_limit_ua &&
+	    chip->primary_fcc_limit_ua >
+	    chip->batt_info->constant_charge_current_max_ua)
+		return dev_err_probe(chip->dev, -EINVAL,
+				     "primary FCC cap exceeds battery limit\n");
 
 	fast_charge_current_ua = match_data->limit_fcc_to_battery ?
 		min(chip->batt_info->constant_charge_current_max_ua,
 		    (int)chip->fast_charge_current_cap_ua) :
 		chip->fast_charge_current_cap_ua;
+	if (chip->primary_fcc_limit_ua)
+		fast_charge_current_ua = min_t(int, fast_charge_current_ua,
+					chip->primary_fcc_limit_ua);
 
 	rc = devm_delayed_work_autocancel(chip->dev, &chip->status_change_work,
 					  smb_status_change_work);

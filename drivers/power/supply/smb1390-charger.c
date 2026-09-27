@@ -77,8 +77,11 @@
 #define SMB1390_POLICY_MIN_VBUS_UV	7000000
 #define SMB1390_POLICY_MAX_VBUS_UV	10000000
 #define SMB1390_POLICY_VBUS_TOLERANCE_UV	500000
+#define SMB1390_POLICY_PD_TOLERANCE_UV	50000
 #define SMB1390_POLICY_MAX_INPUT_UA	2800000
 #define SMB1390_POLICY_MIN_INPUT_UA	1500000
+/* Matches Raphael's USB-C connector op-sink-microwatt. */
+#define SMB1390_POLICY_MIN_POWER_UW	10000000
 #define SMB1390_POLICY_PROVISIONAL_ICL_UA	500000
 #define SMB1390_POLICY_MAX_FCC_UA	5100000
 #define SMB1390_POLICY_MID_FCC_UA	3000000
@@ -629,9 +632,7 @@ static int smb1390_policy_set_fcc(struct smb1390 *chip,
 {
 	int max_fcc, current_fcc, target_fcc, ret;
 
-	ret = smb1390_psy_get_int(chip->main_psy,
-				   POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
-				   &max_fcc);
+	ret = qcom_smbx_get_charge_pump_fcc_max(chip->main_psy, &max_fcc);
 	if (ret)
 		return ret;
 	if (max_fcc < SMB1390_POLICY_EDGE_FCC_UA)
@@ -653,9 +654,7 @@ static int smb1390_policy_set_fcc(struct smb1390 *chip,
 				   &current_fcc);
 	if (ret || current_fcc == target_fcc)
 		return ret;
-	return smb1390_psy_set_int(chip->main_psy,
-				   POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
-				   target_fcc);
+	return qcom_smbx_set_charge_pump_fcc(chip->main_psy, target_fcc);
 }
 
 static int smb1390_policy_stop(struct smb1390 *chip)
@@ -663,10 +662,11 @@ static int smb1390_policy_stop(struct smb1390 *chip)
 	int ret, first_error = 0, online, max_fcc;
 
 	WRITE_ONCE(chip->policy_active, false);
-	ret = smb1390_disable_switcher(chip);
+	/* Restore the primary FCC cap before taking the pump off the path. */
+	ret = qcom_smbx_set_charge_pump(chip->main_psy, false);
 	if (ret)
 		first_error = ret;
-	ret = qcom_smbx_set_charge_pump(chip->main_psy, false);
+	ret = smb1390_disable_switcher(chip);
 	if (ret && !first_error)
 		first_error = ret;
 	ret = smb1390_psy_set_int(chip->main_psy,
@@ -722,8 +722,10 @@ static int smb1390_policy_start(struct smb1390 *chip,
 				struct smb1390_policy_data *data)
 {
 	struct smb1390_policy_data fresh;
-	int online, min_uv, max_uv, max_ua, main_uv, main_icl, die_temp, ret;
+	int online, min_uv, max_uv, max_ua, pd_uv, pd_ua;
+	int main_uv, main_icl, die_temp, ret;
 	u32 target_uv, target_ua, ilim_ua;
+	bool can_voltage_first, can_current_first, current_first;
 	bool switcher_on = false;
 	int attempt;
 
@@ -768,16 +770,63 @@ static int smb1390_policy_start(struct smb1390 *chip,
 		return -ERANGE;
 	target_ua = min_t(u32, max_ua, chip->max_input_ua);
 	if (target_ua < SMB1390_POLICY_MIN_INPUT_UA ||
-	    (u64)target_uv * target_ua < 10000000ULL * 1000000ULL)
+	    (u64)target_uv * target_ua <
+	    (u64)SMB1390_POLICY_MIN_POWER_UW * 1000000)
 		return -ERANGE;
 
+	ret = smb1390_psy_get_int(chip->pd_psy,
+				   POWER_SUPPLY_PROP_VOLTAGE_NOW, &pd_uv);
+	if (ret)
+		return ret;
+	ret = smb1390_psy_get_int(chip->pd_psy,
+				   POWER_SUPPLY_PROP_CURRENT_NOW, &pd_ua);
+	if (ret)
+		return ret;
+	if (pd_uv <= 0 || pd_ua <= 0)
+		return -ERANGE;
+
+	/*
+	 * TCPM checks operating sink power for each PPS request. If the
+	 * initial contract has too little current for the target voltage,
+	 * raise current first while the output is still at its initial
+	 * voltage. Both intermediate contracts must meet that minimum.
+	 */
+	can_voltage_first = (u64)target_uv * pd_ua >=
+		(u64)SMB1390_POLICY_MIN_POWER_UW * 1000000;
+	can_current_first = (u64)pd_uv * target_ua >=
+		(u64)SMB1390_POLICY_MIN_POWER_UW * 1000000;
+	if (!can_voltage_first && !can_current_first)
+		return -ERANGE;
+	current_first = can_current_first &&
+		(!can_voltage_first || pd_ua > target_ua);
+	if (current_first) {
+		ret = smb1390_psy_set_int(chip->pd_psy,
+					  POWER_SUPPLY_PROP_CURRENT_NOW,
+					  target_ua);
+		if (ret || READ_ONCE(chip->irq_faulted))
+			return ret ? ret : -EIO;
+	}
 	ret = smb1390_psy_set_int(chip->pd_psy,
 				  POWER_SUPPLY_PROP_VOLTAGE_NOW, target_uv);
 	if (ret || READ_ONCE(chip->irq_faulted))
 		return ret ? ret : -EIO;
-	ret = smb1390_psy_set_int(chip->pd_psy,
-				  POWER_SUPPLY_PROP_CURRENT_NOW, target_ua);
-	if (ret || READ_ONCE(chip->irq_faulted))
+	if (!current_first) {
+		ret = smb1390_psy_set_int(chip->pd_psy,
+					  POWER_SUPPLY_PROP_CURRENT_NOW,
+					  target_ua);
+		if (ret || READ_ONCE(chip->irq_faulted))
+			return ret ? ret : -EIO;
+	}
+	ret = smb1390_psy_get_int(chip->pd_psy,
+				   POWER_SUPPLY_PROP_VOLTAGE_NOW, &pd_uv);
+	if (ret)
+		return ret;
+	ret = smb1390_psy_get_int(chip->pd_psy,
+				   POWER_SUPPLY_PROP_CURRENT_NOW, &pd_ua);
+	if (ret || abs(pd_uv - (int)target_uv) >
+	    SMB1390_POLICY_PD_TOLERANCE_UV ||
+	    pd_ua < (int)target_ua - 50000 ||
+	    READ_ONCE(chip->irq_faulted))
 		return ret ? ret : -EIO;
 
 	for (attempt = 0; attempt < 10; attempt++) {
@@ -795,8 +844,7 @@ static int smb1390_policy_start(struct smb1390 *chip,
 	}
 	if (attempt == 10)
 		return -ETIMEDOUT;
-	ret = smb1390_psy_set_int(chip->main_psy,
-				  POWER_SUPPLY_PROP_CURRENT_MAX, target_ua);
+	ret = qcom_smbx_set_charge_pump_input_limit(chip->main_psy, target_ua);
 	if (ret)
 		return ret;
 	for (attempt = 0; attempt < 60; attempt++) {

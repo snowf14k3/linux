@@ -65,6 +65,7 @@ struct drv8846 {
 	u32 watchdog_grace_ms;
 	bool fault_latched;
 	bool timeout_latched;
+	bool cutoff_failed;
 	bool suspended;
 	bool removing;
 	unsigned int pending_stops;
@@ -89,11 +90,17 @@ static void drv8846_release_ref(struct kref *ref)
 /* sleep and enable are required to be non-sleeping TLMM GPIOs. */
 static void drv8846_cut_power_locked(struct drv8846 *motor, u32 reason)
 {
+	int sleep_ret, enable_ret;
+
 	if (motor->armed)
 		motor->last_stop_reason = reason;
 	motor->armed = false;
-	gpiod_set_value(motor->sleep, 0);
-	gpiod_set_value(motor->enable, 0);
+	sleep_ret = gpiod_set_value(motor->sleep, 0);
+	enable_ret = gpiod_set_value(motor->enable, 0);
+	if (sleep_ret || enable_ret) {
+		motor->cutoff_failed = true;
+		motor->last_stop_reason = DRV8846_STOP_ERROR;
+	}
 }
 
 static void drv8846_cut_power(struct drv8846 *motor, u32 reason)
@@ -181,6 +188,9 @@ static void drv8846_stop_locked(struct drv8846 *motor, u32 reason)
 
 	drv8846_cut_power(motor, reason);
 	hrtimer_cancel(&motor->watchdog);
+	if (READ_ONCE(motor->cutoff_failed))
+		dev_err_ratelimited(motor->dev,
+				    "motor power cutoff GPIO write failed\n");
 	ret = drv8846_pwm_apply(motor, motor->rampup_period_ns, false);
 	if (ret) {
 		dev_err(motor->dev, "failed to disable motor PWM: %d\n", ret);
@@ -302,6 +312,10 @@ static int drv8846_start(struct drv8846 *motor, u32 direction,
 		ret = -ECANCELED;
 		goto out_command;
 	}
+	if (READ_ONCE(motor->cutoff_failed)) {
+		ret = -EIO;
+		goto out_command;
+	}
 
 	drv8846_cut_power(motor, DRV8846_STOP_ABORTED);
 	hrtimer_cancel(&motor->watchdog);
@@ -315,6 +329,10 @@ static int drv8846_start(struct drv8846 *motor, u32 direction,
 	}
 	if (READ_ONCE(motor->pending_stops)) {
 		ret = -ECANCELED;
+		goto out_unlock;
+	}
+	if (READ_ONCE(motor->cutoff_failed)) {
+		ret = -EIO;
 		goto out_unlock;
 	}
 
@@ -369,7 +387,9 @@ static int drv8846_start(struct drv8846 *motor, u32 direction,
 	hrtimer_start(&motor->watchdog, ms_to_ktime(watchdog_ms),
 		      HRTIMER_MODE_REL);
 	spin_lock_irqsave(&motor->safety_lock, flags);
-	if (motor->fault_latched) {
+	if (motor->cutoff_failed) {
+		ret = -EIO;
+	} else if (motor->fault_latched) {
 		ret = -EIO;
 	} else if (motor->timeout_latched) {
 		ret = -ETIMEDOUT;

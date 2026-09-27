@@ -72,6 +72,18 @@ static u8 akm09970_mode(u32 hz)
 	return AK09970_MODE_CONTINUOUS_10HZ;
 }
 
+static unsigned int akm09970_initial_sample_delay_ms(u32 hz)
+{
+	/* Wait one measurement period plus reset/configuration margin. */
+	if (hz >= 100)
+		return 20;
+	if (hz >= 50)
+		return 30;
+	if (hz >= 20)
+		return 60;
+	return 110;
+}
+
 static void akm09970_invalidate_sample_locked(struct akm09970 *sensor,
 					       bool error)
 {
@@ -135,7 +147,8 @@ static int akm09970_activate_locked(struct akm09970 *sensor)
 	sensor->active = true;
 	akm09970_invalidate_sample_locked(sensor, false);
 	mod_delayed_work(system_wq, &sensor->initial_sample_work,
-			 msecs_to_jiffies(20));
+			 msecs_to_jiffies(akm09970_initial_sample_delay_ms(
+							 sensor->measure_hz)));
 	return 0;
 }
 
@@ -191,7 +204,9 @@ static void akm09970_initial_sample_work(struct work_struct *work)
 			     initial_sample_work);
 
 	mutex_lock(&sensor->lock);
-	akm09970_read_sample_locked(sensor);
+	/* The data-ready IRQ may already have delivered the first sample. */
+	if (!sensor->sample_valid)
+		akm09970_read_sample_locked(sensor);
 	mutex_unlock(&sensor->lock);
 }
 
@@ -291,12 +306,22 @@ static long akm09970_ioctl(struct file *file, unsigned int cmd,
 			ret = -EBUSY;
 			break;
 		}
+		if (sensor->active) {
+			ret = i2c_smbus_write_byte_data(sensor->client,
+					AK09970_REG_CNTL2,
+					akm09970_mode(payload.sensor_mode));
+			if (ret) {
+				akm09970_invalidate_sample_locked(sensor, true);
+				break;
+			}
+		}
 		sensor->measure_hz = payload.sensor_mode;
 		akm09970_invalidate_sample_locked(sensor, false);
 		if (sensor->active)
-			ret = i2c_smbus_write_byte_data(sensor->client,
-					AK09970_REG_CNTL2,
-					akm09970_mode(sensor->measure_hz));
+			mod_delayed_work(system_wq, &sensor->initial_sample_work,
+				msecs_to_jiffies(
+					akm09970_initial_sample_delay_ms(
+						sensor->measure_hz)));
 		break;
 	case AKM_IOC_GET_SENSEDATA:
 		payload.sensor_state = sensor->active;

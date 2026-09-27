@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Opt-in Raphael SMB1390 bring-up variant. The base board DTB retains its
+ * 1.5 A input and battery limits and keeps the charge pump disabled.
+ *
+ * Downstream Raphael sets USB ICL to 2.8 A and FCC to 5.1 A. The mainline
+ * primary path remains capped to 1.8 A USB input and 1.5 A battery current;
+ * only the guarded PPS charge pump policy may request the higher ceilings.
+ */
+#include "sm8150-xiaomi-raphael.dts"
+
+/ {
+	model = "Xiaomi Redmi K20 Pro (charge pump evaluation)";
+};
+
+&battery {
+	constant-charge-current-max-microamp = <5100000>;
+};
+
+&pm8150b_charger {
+	input-current-limit-microamp = <2800000>;
+	qcom,primary-input-current-limit-microamp = <1800000>;
+};
+
+&i2c4 {
+	status = "okay";
+};
+
+&smb1390 {
+	qcom,max-input-current-microamp = <2800000>;
+	status = "okay";
+};

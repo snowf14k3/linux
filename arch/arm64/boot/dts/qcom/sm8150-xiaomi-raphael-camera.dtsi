@@ -179,7 +179,7 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 
-			camera@1a {
+			raphael_main_camera: camera@1a {
 				compatible = "sony,imx586";
 				reg = <0x1a>;
 				clocks = <&camcc CAM_CC_MCLK0_CLK>;
@@ -206,7 +206,7 @@
 				};
 			};
 
-			camera@56 {
+			raphael_front_camera: camera@56 {
 				compatible = "samsung,s5k3t2";
 				reg = <0x56>;
 				clocks = <&camcc CAM_CC_MCLK2_CLK>;
@@ -236,7 +236,7 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 
-			camera@36 {
+			raphael_tele_camera: camera@36 {
 				compatible = "xiaomi,raphael-ov8856";
 				reg = <0x36>;
 				clocks = <&camcc CAM_CC_MCLK1_CLK>;
@@ -292,7 +292,7 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 
-			camera@10 {
+			raphael_ultra_camera: camera@10 {
 				compatible = "samsung,s5k3l6";
 				reg = <0x10>;
 				clocks = <&camcc CAM_CC_MCLK3_CLK>;

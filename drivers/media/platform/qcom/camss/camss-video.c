@@ -510,6 +510,8 @@ static int __video_try_fmt(struct camss_video *video, struct v4l2_format *f)
 
 	if (video->line_based)
 		for (i = 0; i < pix_mp->num_planes; i++) {
+			u32 min_sizeimage;
+
 			p = &pix_mp->plane_fmt[i];
 			p->bytesperline = clamp_t(u32, p->bytesperline,
 						  1, 65528);
@@ -526,6 +528,12 @@ static int __video_try_fmt(struct camss_video *video, struct v4l2_format *f)
 
 			if (p->sizeimage < sizeimage[i])
 				p->sizeimage = sizeimage[i];
+
+			/* Include every row of subsampled data in the same plane. */
+			min_sizeimage = DIV_ROUND_UP(
+				pix_mp->height * fi->vsub[i].denominator,
+				fi->vsub[i].numerator) * p->bytesperline;
+			p->sizeimage = max(p->sizeimage, min_sizeimage);
 		}
 
 	return 0;

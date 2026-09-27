@@ -1,0 +1,95 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Opt-in Raphael camera bring-up variant. The default board DTB keeps the
+ * unverified camera rails and clients disabled. This variant exposes all four
+ * sensor RAW paths, their lenses and read-only calibration EEPROMs.
+ *
+ * The front camera must be raised separately before capture; this device tree
+ * does not provide an automatic motor/Hall interlock. VFE PIX/ISP output is
+ * still hidden by the SM8150 CAMSS driver.
+ */
+#include "sm8150-xiaomi-raphael.dts"
+
+/ {
+	model = "Xiaomi Redmi K20 Pro (RAW camera evaluation)";
+};
+
+&camera_vio {
+	status = "okay";
+};
+
+&camera_main_vaf {
+	status = "okay";
+};
+
+&camera_tele_vaf {
+	status = "okay";
+};
+
+&camera_main_dvdd {
+	status = "okay";
+};
+
+&camera_tele_dvdd {
+	status = "okay";
+};
+
+&camera_front_dvdd {
+	status = "okay";
+};
+
+&camera_ultra_dvdd {
+	status = "okay";
+};
+
+&cci0 {
+	status = "okay";
+};
+
+&cci1 {
+	status = "okay";
+};
+
+&camss {
+	status = "okay";
+};
+
+&raphael_main_camera {
+	status = "okay";
+};
+
+&raphael_tele_camera {
+	status = "okay";
+};
+
+&raphael_ultra_camera {
+	status = "okay";
+};
+
+&raphael_front_camera {
+	status = "okay";
+};
+
+&raphael_main_vcm {
+	status = "okay";
+};
+
+&raphael_tele_vcm {
+	status = "okay";
+};
+
+&raphael_main_eeprom {
+	status = "okay";
+};
+
+&raphael_tele_eeprom {
+	status = "okay";
+};
+
+&raphael_ultra_eeprom {
+	status = "okay";
+};
+
+&raphael_front_eeprom {
+	status = "okay";
+};
