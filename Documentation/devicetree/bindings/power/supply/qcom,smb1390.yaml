@@ -11,11 +11,20 @@ maintainers:
 
 description: |
   The SMB1390 is an I2C-controlled divide-by-two charge pump. The driver
-  exposes its fault state and die temperature. Enabling the pump requires
-  a coordinated charger and USB input policy.
+  exposes its fault state, switcher status and die temperature. Enabling the
+  pump requires a coordinated charger and USB input policy.
 
 allOf:
   - $ref: power-supply.yaml#
+  - if:
+      required:
+        - qcom,pps-charge-pump-policy
+    then:
+      properties:
+        io-channels:
+          minItems: 3
+        io-channel-names:
+          minItems: 3
 
 properties:
   compatible:
@@ -24,13 +33,64 @@ properties:
   reg:
     maxItems: 1
 
-  io-channels:
+  interrupts:
     maxItems: 1
-    description: PM8150B ADC channel connected to the SMB1390 die monitor
+
+  interrupt-names:
+    items:
+      - const: fault
+
+  io-channels:
+    minItems: 1
+    maxItems: 3
+    items:
+      - description: SMB1390 die monitor
+      - description: USB connector thermistor
+      - description: Handset skin thermistor
 
   io-channel-names:
+    minItems: 1
+    maxItems: 3
     items:
       - const: die-temp
+      - const: connector-temp
+      - const: skin-temp
+
+  usb-pd-supply:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: TCPM power supply controlling the USB PD contract.
+
+  main-charger-supply:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: PM8150B charger power supply feeding the battery.
+
+  battery-supply:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: PM8150B fuel gauge providing battery state and temperature.
+
+  qcom,pps-charge-pump-policy:
+    type: boolean
+    description: |
+      Enable autonomous PPS charge pump control with battery, input and
+      switcher fault checks. Requires all supply references and the fault IRQ.
+
+  qcom,max-input-current-microamp:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1500000
+    maximum: 2800000
+    multipleOf: 50000
+    description: Conservative USB input current cap used by the PPS policy.
+
+dependencies:
+  usb-pd-supply: [main-charger-supply, battery-supply, interrupts,
+                  interrupt-names]
+  main-charger-supply: [usb-pd-supply, battery-supply]
+  battery-supply: [usb-pd-supply, main-charger-supply]
+  interrupts: [interrupt-names]
+  interrupt-names: [interrupts]
+  qcom,pps-charge-pump-policy: [usb-pd-supply, main-charger-supply,
+                                battery-supply, interrupts, interrupt-names,
+                                qcom,max-input-current-microamp]
 
 required:
   - compatible

@@ -711,6 +711,13 @@
 	status = "okay";
 	monitored-battery = <&battery>;
 	power-supplies = <&pm8150b_charger>;
+	interrupts = <0x2 0x40 0x3 IRQ_TYPE_EDGE_RISING>,
+		     <0x2 0x42 0x0 IRQ_TYPE_EDGE_BOTH>;
+	interrupt-names = "soc-delta", "batt-missing";
+	qcom,fg-gen4-dma;
+	qcom,fg-therm-coefficients = <0x2318 0x0d0c 0xdaf7 0xc556 0x848d>;
+	qcom,fg-therm-center-offset = <0x70>;
+	qcom,fg-therm-pull-up-kohms = <100>;
 	//power-supplies = <&ln8000_charger>;
 };
 

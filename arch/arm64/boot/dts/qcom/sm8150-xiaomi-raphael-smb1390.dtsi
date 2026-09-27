@@ -5,6 +5,7 @@
  */
 
 #include <dt-bindings/iio/qcom,spmi-vadc.h>
+#include <dt-bindings/interrupt-controller/irq.h>
 
 &pm8150b_adc {
 	channel@e {
@@ -19,8 +20,18 @@
 	smb1390: charge-pump@10 {
 		compatible = "qcom,smb1390";
 		reg = <0x10>;
-		io-channels = <&pm8150b_adc ADC5_AMUX_THM2>;
-		io-channel-names = "die-temp";
+		interrupt-parent = <&spmi_bus>;
+		interrupts = <0x2 0xc5 0x0 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "fault";
+		io-channels = <&pm8150b_adc ADC5_AMUX_THM2>,
+			      <&pm8150b_adc ADC5_AMUX_THM3_100K_PU>,
+			      <&pm8150l_adc ADC5_AMUX_THM2_100K_PU>;
+		io-channel-names = "die-temp", "connector-temp", "skin-temp";
+		usb-pd-supply = <&pm8150b_typec>;
+		main-charger-supply = <&pm8150b_charger>;
+		battery-supply = <&pm8150b_fg>;
+		qcom,pps-charge-pump-policy;
+		qcom,max-input-current-microamp = <1500000>;
 		status = "disabled";
 	};
 };
