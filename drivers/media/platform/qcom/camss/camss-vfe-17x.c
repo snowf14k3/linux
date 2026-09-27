@@ -62,7 +62,7 @@
 
 #define VFE_IRQ_STATUS_0				(0x06c)
 #define		STATUS_0_CAMIF_SOF			BIT(0)
-#define		STATUS_0_BUS_IRQ			BIT(9)
+#define		STATUS_0_CAMIF_REG_UPDATE		BIT(4)
 #define		STATUS_0_RDI_REG_UPDATE(n)		BIT((n) + 5)
 #define		STATUS_0_IMAGE_MASTER_PING_PONG(n)	BIT((n) + 8)
 #define		STATUS_0_IMAGE_COMPOSITE_DONE(n)	BIT((n) + 25)
@@ -94,12 +94,19 @@
 #define		CFG_RAW_CROP_EN			BIT(22)
 
 #define VFE_REG_UPDATE_CMD			(0x4ac)
+#define		REG_UPDATE_CAMIF		BIT(0)
 #define		REG_UPDATE_RDI(n)		BIT(1 + (n))
 
 #define VFE_BUS_IRQ_MASK(n)		(0x2044 + (n) * 4)
 #define VFE_BUS_IRQ_CLEAR(n)		(0x2050 + (n) * 4)
 #define VFE_BUS_IRQ_STATUS(n)		(0x205c + (n) * 4)
 #define VFE_BUS_IRQ_REG_NUM		3
+#define VFE_BUS_COMP_GRP0_MASK		(0x2010)
+#define VFE175_WM_PIX_Y			3
+#define VFE175_WM_PIX_C			4
+#define VFE175_PIX_COMP_MASK		(BIT(VFE175_WM_PIX_Y) | BIT(VFE175_WM_PIX_C))
+#define VFE175_PACKER_NV12		0xe
+#define VFE175_PACKER_NV21_C		0xf
 #define		STATUS0_COMP_RESET_DONE		BIT(0)
 #define		STATUS0_COMP_REG_UPDATE0_DONE	BIT(1)
 #define		STATUS0_COMP_REG_UPDATE1_DONE	BIT(2)
@@ -206,8 +213,14 @@ static void vfe_global_reset(struct vfe_device *vfe)
 	writel_relaxed(reset_bits, vfe->base + VFE_GLOBAL_RESET_CMD);
 }
 
+static bool vfe_is_sm8150_pix(struct vfe_device *vfe,
+			      enum vfe_line_id line_id);
+
 static void vfe_wm_start(struct vfe_device *vfe, u8 wm, struct vfe_line *line)
 {
+	struct v4l2_pix_format_mplane *pix =
+		&line->video_out.active_fmt.fmt.pix_mp;
+	bool is_pix = vfe_is_sm8150_pix(vfe, line->id);
 	u32 val;
 
 	/*Set Debug Registers*/
@@ -224,28 +237,39 @@ static void vfe_wm_start(struct vfe_device *vfe, u8 wm, struct vfe_line *line)
 
 	writel_relaxed(0x0, vfe->base + VFE_BUS_WM_TEST_BUS_CTRL);
 
-	/* if addr_no_sync has default value then config the addr no sync reg */
 	val = WM_ADDR_NO_SYNC_DEFAULT_VAL;
+	if (vfe->camss->res->version == CAMSS_8150 && !vfe_is_lite(vfe) &&
+	    vfe->wm_output_map[VFE175_WM_PIX_Y] == VFE_LINE_PIX &&
+	    vfe->wm_output_map[VFE175_WM_PIX_C] == VFE_LINE_PIX)
+		val &= ~VFE175_PIX_COMP_MASK;
 	writel_relaxed(val, vfe->base + VFE_BUS_WM_ADDR_SYNC_NO_SYNC);
+	if (is_pix)
+		writel_relaxed(VFE175_PIX_COMP_MASK,
+			       vfe->base + VFE_BUS_COMP_GRP0_MASK);
 
 	writel_relaxed(0xf, vfe->base + VFE_BUS_WM_BURST_LIMIT(wm));
 
-	val = WM_BUFFER_DEFAULT_WIDTH;
+	val = is_pix ? pix->width : WM_BUFFER_DEFAULT_WIDTH;
 	writel_relaxed(val, vfe->base + VFE_BUS_WM_BUFFER_WIDTH_CFG(wm));
 
-	val = 0;
+	val = is_pix ? pix->height / (wm == VFE175_WM_PIX_C ? 2 : 1) : 0;
 	writel_relaxed(val, vfe->base + VFE_BUS_WM_BUFFER_HEIGHT_CFG(wm));
 
 	val = 0;
-	writel_relaxed(val, vfe->base + VFE_BUS_WM_PACKER_CFG(wm)); // XXX 1 for PLAIN8?
+	if (is_pix) {
+		val = VFE175_PACKER_NV12;
+		if (pix->pixelformat == V4L2_PIX_FMT_NV21 &&
+		    wm == VFE175_WM_PIX_C)
+			val = VFE175_PACKER_NV21_C;
+	}
+	writel_relaxed(val, vfe->base + VFE_BUS_WM_PACKER_CFG(wm));
 
-	/* Configure stride for RDIs */
-	val = WM_STRIDE_DEFAULT_STRIDE;
+	val = is_pix ? pix->plane_fmt[0].bytesperline : WM_STRIDE_DEFAULT_STRIDE;
 	writel_relaxed(val, vfe->base + VFE_BUS_WM_STRIDE(wm));
 
 	/* Enable WM */
-	val = 1 << WM_CFG_EN |
-	      MODE_MIPI_RAW << WM_CFG_MODE;
+	val = BIT(WM_CFG_EN) |
+	      (is_pix ? MODE_QCOM_PLAIN : MODE_MIPI_RAW) << WM_CFG_MODE;
 	writel_relaxed(val, vfe->base + VFE_BUS_WM_CFG(wm));
 }
 
@@ -253,6 +277,14 @@ static void vfe_wm_stop(struct vfe_device *vfe, u8 wm)
 {
 	/* Disable WM */
 	writel_relaxed(0, vfe->base + VFE_BUS_WM_CFG(wm));
+	if (wm == VFE175_WM_PIX_C &&
+	    vfe_is_sm8150_pix(vfe, vfe->wm_output_map[wm])) {
+		writel_relaxed(0, vfe->base + VFE_BUS_COMP_GRP0_MASK);
+		writel_relaxed(readl_relaxed(vfe->base +
+					   VFE_BUS_WM_ADDR_SYNC_NO_SYNC) |
+			       VFE175_PIX_COMP_MASK,
+			       vfe->base + VFE_BUS_WM_ADDR_SYNC_NO_SYNC);
+	}
 }
 
 static void vfe_wm_update(struct vfe_device *vfe, u8 wm, u32 addr,
@@ -261,14 +293,33 @@ static void vfe_wm_update(struct vfe_device *vfe, u8 wm, u32 addr,
 	struct v4l2_pix_format_mplane *pix =
 		&line->video_out.active_fmt.fmt.pix_mp;
 	u32 stride = pix->plane_fmt[0].bytesperline;
+	u32 height = pix->height;
+
+	if (vfe_is_sm8150_pix(vfe, line->id) && wm == VFE175_WM_PIX_C)
+		height /= 2;
 
 	writel_relaxed(addr, vfe->base + VFE_BUS_WM_IMAGE_ADDR(wm));
-	writel_relaxed(stride * pix->height, vfe->base + VFE_BUS_WM_FRAME_INC(wm));
+	writel_relaxed(stride * height, vfe->base + VFE_BUS_WM_FRAME_INC(wm));
+}
+
+static bool vfe_is_sm8150_pix(struct vfe_device *vfe,
+			      enum vfe_line_id line_id)
+{
+	/* Full VFE slot 3 is CAMIF; Lite slot 3 is RDI3. */
+	return vfe->camss->res->version == CAMSS_8150 &&
+	       !vfe_is_lite(vfe) && line_id == VFE_LINE_PIX;
+}
+
+static u32 vfe_reg_update_bit(struct vfe_device *vfe,
+			      enum vfe_line_id line_id)
+{
+	return vfe_is_sm8150_pix(vfe, line_id) ?
+		REG_UPDATE_CAMIF : REG_UPDATE_RDI(line_id);
 }
 
 static void vfe_reg_update(struct vfe_device *vfe, enum vfe_line_id line_id)
 {
-	vfe->reg_update |= REG_UPDATE_RDI(line_id);
+	vfe->reg_update |= vfe_reg_update_bit(vfe, line_id);
 
 	/* Enforce ordering between previous reg writes and reg update */
 	wmb();
@@ -282,7 +333,7 @@ static void vfe_reg_update(struct vfe_device *vfe, enum vfe_line_id line_id)
 static inline void vfe_reg_update_clear(struct vfe_device *vfe,
 					enum vfe_line_id line_id)
 {
-	vfe->reg_update &= ~REG_UPDATE_RDI(line_id);
+	vfe->reg_update &= ~vfe_reg_update_bit(vfe, line_id);
 }
 
 static void vfe_enable_irq_common(struct vfe_device *vfe)
@@ -355,7 +406,9 @@ static irqreturn_t vfe_isr(int irq, void *dev)
 		vfe->isr_ops.reset_ack(vfe);
 
 	for (i = VFE_LINE_RDI0; i < vfe->res->line_num; i++)
-		if (status0 & STATUS_0_RDI_REG_UPDATE(i))
+		if (status0 & (vfe_is_sm8150_pix(vfe, i) ?
+			       STATUS_0_CAMIF_REG_UPDATE :
+			       STATUS_0_RDI_REG_UPDATE(i)))
 			vfe->isr_ops.reg_update(vfe, i);
 
 	for (i = VFE_LINE_RDI0; i < vfe->res->line_num; i++)
@@ -363,14 +416,16 @@ static irqreturn_t vfe_isr(int irq, void *dev)
 			vfe->isr_ops.sof(vfe, i);
 
 	for (i = 0; i < MSM_VFE_COMPOSITE_IRQ_NUM; i++)
-		if (vfe_bus_status[0] & STATUS0_COMP_BUF_DONE(i))
+		if (vfe_bus_status[0] & STATUS0_COMP_BUF_DONE(i) &&
+		    (!vfe_is_sm8150_pix(vfe,
+			vfe->wm_output_map[VFE175_WM_PIX_Y]) || !i))
 			vfe->isr_ops.comp_done(vfe, i);
 
-	/* Top bit 9 is the aggregate bus IRQ; status bank 1 identifies the WM. */
-	if (status0 & STATUS_0_BUS_IRQ)
-		for (wm = 0; wm < MSM_VFE_IMAGE_MASTERS_NUM; wm++)
-			if (vfe_bus_status[1] & STATUS1_WM_CLIENT_BUF_DONE(wm))
-				vfe->isr_ops.wm_done(vfe, wm);
+	/* FULL delivers one frame on comp0, not once per Y/chroma client. */
+	for (wm = 0; wm < MSM_VFE_IMAGE_MASTERS_NUM; wm++)
+		if (vfe_bus_status[1] & STATUS1_WM_CLIENT_BUF_DONE(wm) &&
+		    !vfe_is_sm8150_pix(vfe, vfe->wm_output_map[wm]))
+			vfe->isr_ops.wm_done(vfe, wm);
 
 	return IRQ_HANDLED;
 }
@@ -387,7 +442,7 @@ static int vfe_halt(struct vfe_device *vfe)
 	return 0;
 }
 
-static int vfe_get_output(struct vfe_line *line)
+static int vfe_get_output_pix(struct vfe_line *line)
 {
 	struct vfe_device *vfe = to_vfe(line);
 	struct vfe_output *output;
@@ -402,27 +457,34 @@ static int vfe_get_output(struct vfe_line *line)
 		goto error;
 	}
 
-	output->wm_num = 1;
+	if (vfe_is_sm8150_pix(vfe, line->id)) {
+		/* VFE175 FULL has fixed Y and chroma clients. */
+		if (vfe->wm_output_map[VFE175_WM_PIX_Y] != VFE_LINE_NONE ||
+		    vfe->wm_output_map[VFE175_WM_PIX_C] != VFE_LINE_NONE)
+			goto error;
 
-	wm_idx = vfe_reserve_wm(vfe, line->id);
-	if (wm_idx < 0) {
-		dev_err(vfe->camss->dev, "Can not reserve wm\n");
-		goto error_get_wm;
+		output->wm_num = 2;
+		output->wm_idx[0] = VFE175_WM_PIX_Y;
+		output->wm_idx[1] = VFE175_WM_PIX_C;
+		vfe->wm_output_map[VFE175_WM_PIX_Y] = line->id;
+		vfe->wm_output_map[VFE175_WM_PIX_C] = line->id;
+	} else {
+		output->wm_num = 1;
+		wm_idx = vfe_reserve_wm(vfe, line->id);
+		if (wm_idx < 0) {
+			dev_err(vfe->camss->dev, "Can not reserve wm\n");
+			output->state = VFE_OUTPUT_OFF;
+			goto error;
+		}
+		output->wm_idx[0] = wm_idx;
 	}
-	output->wm_idx[0] = wm_idx;
-
 	output->drop_update_idx = 0;
 
 	spin_unlock_irqrestore(&vfe->output_lock, flags);
-
 	return 0;
 
-error_get_wm:
-	vfe_release_wm(vfe, output->wm_idx[0]);
-	output->state = VFE_OUTPUT_OFF;
 error:
 	spin_unlock_irqrestore(&vfe->output_lock, flags);
-
 	return -EINVAL;
 }
 
@@ -435,7 +497,16 @@ error:
 static int vfe_enable(struct vfe_line *line)
 {
 	struct vfe_device *vfe = to_vfe(line);
+	struct v4l2_pix_format_mplane *pix =
+		&line->video_out.active_fmt.fmt.pix_mp;
 	int ret;
+
+	if (vfe_is_sm8150_pix(vfe, line->id) &&
+	    ((pix->pixelformat != V4L2_PIX_FMT_NV12 &&
+	      pix->pixelformat != V4L2_PIX_FMT_NV21) ||
+	     (pix->width & 1) || (pix->height & 1) ||
+	     (pix->plane_fmt[0].bytesperline & 15)))
+		return -EINVAL;
 
 	mutex_lock(&vfe->stream_lock);
 
@@ -446,11 +517,12 @@ static int vfe_enable(struct vfe_line *line)
 
 	mutex_unlock(&vfe->stream_lock);
 
-	/* SM8150 Lite RDI outputs are hard-wired to the matching WM index. */
-	if (vfe->camss->res->version == CAMSS_8150 && vfe_is_lite(vfe))
-		ret = vfe_get_output_v2(line);
+	/* SM8150 Lite uses slot 3 for RDI3; other slot-3 lines are PIX. */
+	if (line->id == VFE_LINE_PIX &&
+	    !(vfe->camss->res->version == CAMSS_8150 && vfe_is_lite(vfe)))
+		ret = vfe_get_output_pix(line);
 	else
-		ret = vfe_get_output(line);
+		ret = vfe_get_output_v2(line);
 	if (ret < 0)
 		goto error_get_output;
 
@@ -550,7 +622,7 @@ static void vfe_isr_wm_done(struct vfe_device *vfe, u8 wm)
 	output->buf[index] = vfe_buf_get_pending(output);
 
 	if (output->buf[index])
-		vfe_wm_update(vfe, output->wm_idx[0], output->buf[index]->addr[0], line);
+		vfe_wm_update_buffer(vfe, line, output->buf[index]);
 	else
 		output->gen2.active_num--;
 

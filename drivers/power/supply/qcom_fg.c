@@ -2,10 +2,13 @@
 /* Copyright (c) 2020, The Linux Foundation. All rights reserved. */
 
 #include <linux/device.h>
+#include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
@@ -14,6 +17,7 @@
 #include <linux/regmap.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
+#include <soc/qcom/qcom-spmi-pmic.h>
 
 /* SOC */
 #define BATT_MONOTONIC_SOC 0x009
@@ -29,6 +33,29 @@
 
 /* RRADC */
 #define ADC_RR_BATT_TEMP_LSB 0x288
+#define GEN4_ADC_RR_INT_RT_STS 0x210
+#define GEN4_BATT_MISSING BIT(0)
+#define GEN4_ADC_RR_BATT_THERM_CFG 0x281
+#define GEN4_BATT_THERM_PULL_UP_MASK GENMASK(1, 0)
+
+/* PM8150B Gen4 registers, relative to the FG SOC base at 0x4000. */
+#define GEN4_BATT_INFO_PEEK_MUX4 0x1ee
+#define GEN4_BATT_INFO_PEEK_RD 0x1ef
+#define GEN4_ALG_ACTIVE BIT(3)
+#define GEN4_MEM_IF_INT_RT_STS(chip) (chip->ops->memif_base + 0x10)
+#define GEN4_MEM_IF_MEM_ARB_CFG(chip) (chip->ops->memif_base + 0x40)
+#define GEN4_MEM_ARB_REQ BIT(0)
+#define GEN4_MEM_ARB_LO_LATENCY_EN BIT(1)
+#define GEN4_MEM_CLR_LOG BIT(2)
+#define GEN4_MEM_GNT BIT(3)
+#define GEN4_IACS_SLCT BIT(5)
+#define GEN4_DMA_ADDR_KIND BIT(1)
+
+/* Gen4 SRAM is addressed in two-byte words. */
+#define GEN4_BATT_THERM_CENTER_WORD 3
+#define GEN4_BATT_THERM_COEFF_WORD 4
+#define GEN4_BATT_TEMP_WORD 328
+#define GEN4_BATT_THERM_COEFF_COUNT 5
 
 /* MEMIF */
 #define MEM_INTF_STS(chip) (chip->ops->memif_base + 0x10)
@@ -101,6 +128,18 @@ struct qcom_fg_chip {
 	spinlock_t sram_request_lock;
 	spinlock_t sram_rw_lock;
 	int sram_requests;
+
+	/* Enabled only by the board's explicit Gen4 DMA opt-in. */
+	bool gen4_dma;
+	bool gen4_v1;
+	bool gen4_ntc_valid;
+	bool gen4_ntc_applied;
+	bool gen4_dma_faulted;
+	struct mutex gen4_dma_lock;
+	struct mutex gen4_ntc_lock;
+	u16 gen4_ntc_coeffs[GEN4_BATT_THERM_COEFF_COUNT];
+	u8 gen4_ntc_center;
+	u8 gen4_ntc_pull_up;
 };
 
 /************************
@@ -138,7 +177,7 @@ static int qcom_fg_read(struct qcom_fg_chip *chip, u8 *val, u16 addr, int len)
  */
 static int qcom_fg_write(struct qcom_fg_chip *chip, u8 *val, u16 addr, int len)
 {
-	bool sec_access = (addr & 0xff) > 0xd0;
+	bool sec_access = !chip->gen4_dma && (addr & 0xff) > 0xd0;
 	u8 sec_addr_val = 0xa5;
 	int ret;
 
@@ -182,6 +221,306 @@ static int qcom_fg_masked_write(struct qcom_fg_chip *chip, u16 addr, u8 mask,
 	reg |= val & mask;
 
 	return qcom_fg_write(chip, &reg, addr, 1);
+}
+
+struct qcom_fg_gen4_dma_partition {
+	u16 first_word;
+	u16 last_word;
+	u16 reg_offset;
+};
+
+/* PM8150B FG DMA windows, expressed relative to the 0x4000 SOC base. */
+static const struct qcom_fg_gen4_dma_partition qcom_fg_gen4_dma_map[] = {
+	{ 0, 63, 0x420 },
+	{ 64, 169, 0x520 },
+	{ 170, 274, 0x620 },
+	{ 275, 299, 0x720 },
+	{ 300, 405, 0x820 },
+	{ 406, 486, 0x920 },
+};
+
+static int qcom_fg_gen4_battery_present(struct qcom_fg_chip *chip, bool *present)
+{
+	u8 status;
+	int ret;
+
+	ret = qcom_fg_read(chip, &status, GEN4_ADC_RR_INT_RT_STS, 1);
+	if (ret)
+		return ret;
+
+	*present = !(status & GEN4_BATT_MISSING);
+	return 0;
+}
+
+static int qcom_fg_gen4_dma_release(struct qcom_fg_chip *chip)
+{
+	int ret, ret2;
+
+	ret = qcom_fg_masked_write(chip, MEM_INTF_CFG(chip),
+				   RIF_MEM_ACCESS_REQ | GEN4_IACS_SLCT, 0);
+	ret2 = qcom_fg_masked_write(chip, GEN4_MEM_IF_MEM_ARB_CFG(chip),
+				    GEN4_MEM_ARB_REQ, 0);
+
+	return ret ? ret : ret2;
+}
+
+static int qcom_fg_gen4_dma_wait_alg_idle(struct qcom_fg_chip *chip)
+{
+	u8 status;
+	int ret, i;
+
+	/* PM8150B v1 may keep ALG active for 320 ms during ESR pulsing. */
+	for (i = 0; i < 35; i++) {
+		ret = qcom_fg_read(chip, &status, GEN4_BATT_INFO_PEEK_RD, 1);
+		if (ret)
+			return ret;
+		if (!(status & GEN4_ALG_ACTIVE)) {
+			usleep_range(1000, 1100);
+			return 0;
+		}
+		usleep_range(10000, 10010);
+	}
+
+	return -ETIMEDOUT;
+}
+
+static int qcom_fg_gen4_dma_request(struct qcom_fg_chip *chip)
+{
+	u8 status;
+	int ret, release_ret, i;
+
+	if (chip->gen4_v1) {
+		ret = qcom_fg_gen4_dma_wait_alg_idle(chip);
+		if (ret)
+			return ret;
+	}
+
+	ret = qcom_fg_masked_write(chip, GEN4_MEM_IF_MEM_ARB_CFG(chip),
+				   GEN4_MEM_ARB_REQ, GEN4_MEM_ARB_REQ);
+	if (ret)
+		goto release;
+
+	ret = qcom_fg_masked_write(chip, MEM_INTF_CFG(chip),
+				   RIF_MEM_ACCESS_REQ | GEN4_IACS_SLCT,
+				   RIF_MEM_ACCESS_REQ);
+	if (ret)
+		goto release;
+
+	/* Five 200 kHz hardware cycles are required before checking grant. */
+	usleep_range(40, 50);
+	for (i = 0; i < 50; i++) {
+		ret = qcom_fg_read(chip, &status, GEN4_MEM_IF_INT_RT_STS(chip), 1);
+		if (ret)
+			goto release;
+		if (status & GEN4_MEM_GNT) {
+			if (chip->gen4_v1)
+				usleep_range(1000, 1100);
+			return 0;
+		}
+		usleep_range(10000, 10100);
+	}
+
+	ret = -ETIMEDOUT;
+release:
+	release_ret = qcom_fg_gen4_dma_release(chip);
+	if (release_ret) {
+		chip->gen4_dma_faulted = true;
+		dev_err(chip->dev, "Failed to release Gen4 DMA after request error\n");
+	}
+	return ret;
+}
+
+static int qcom_fg_gen4_dma_transfer(struct qcom_fg_chip *chip, u16 word,
+				     u8 offset, u8 *data, size_t len, bool write)
+{
+	const struct qcom_fg_gen4_dma_partition *part;
+	size_t chunk;
+	u16 reg;
+	int ret, release_ret, i;
+
+	if (offset >= 2 || !len)
+		return -EINVAL;
+
+	mutex_lock(&chip->gen4_dma_lock);
+	if (chip->gen4_dma_faulted) {
+		ret = -EIO;
+		goto unlock;
+	}
+	ret = qcom_fg_gen4_dma_request(chip);
+	if (ret)
+		goto unlock;
+
+	while (len) {
+		part = NULL;
+		for (i = 0; i < ARRAY_SIZE(qcom_fg_gen4_dma_map); i++) {
+			if (word >= qcom_fg_gen4_dma_map[i].first_word &&
+			    word <= qcom_fg_gen4_dma_map[i].last_word) {
+				part = &qcom_fg_gen4_dma_map[i];
+				break;
+			}
+		}
+		if (!part) {
+			ret = -EINVAL;
+			break;
+		}
+
+		chunk = min(len, (size_t)(part->last_word - word + 1) * 2 - offset);
+		/* SPMI extended transfers carry at most eight bytes per command. */
+		chunk = min_t(size_t, chunk, 8);
+		reg = part->reg_offset + (word - part->first_word) * 2 + offset;
+		if (write)
+			ret = qcom_fg_write(chip, data, reg, chunk);
+		else
+			ret = qcom_fg_read(chip, data, reg, chunk);
+		if (ret)
+			break;
+
+		data += chunk;
+		len -= chunk;
+		word += (offset + chunk) / 2;
+		offset = (offset + chunk) % 2;
+	}
+
+	release_ret = qcom_fg_gen4_dma_release(chip);
+	if (release_ret) {
+		chip->gen4_dma_faulted = true;
+		dev_err(chip->dev, "Failed to release Gen4 DMA: %d\n",
+			release_ret);
+	}
+	if (!ret)
+		ret = release_ret;
+unlock:
+	mutex_unlock(&chip->gen4_dma_lock);
+	return ret;
+}
+
+static int qcom_fg_gen4_dma_init(struct qcom_fg_chip *chip)
+{
+	u8 status, peek_mux = 0xac;
+	int ret;
+
+	ret = qcom_fg_read(chip, &status, MEM_IF_DMA_STS(chip), 1);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_masked_write(chip, MEM_IF_DMA_CTL(chip), BIT(0),
+				   status & (BIT(1) | BIT(2)) ? BIT(0) : 0);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_masked_write(chip, MEM_IF_DMA_CTL(chip),
+				   GEN4_DMA_ADDR_KIND, GEN4_DMA_ADDR_KIND);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_gen4_dma_release(chip);
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_masked_write(chip, GEN4_MEM_IF_MEM_ARB_CFG(chip),
+				   GEN4_MEM_ARB_LO_LATENCY_EN | GEN4_MEM_CLR_LOG,
+				   GEN4_MEM_ARB_LO_LATENCY_EN);
+	if (ret)
+		return ret;
+
+	/* Used by the v1 DMA workaround and later ADC lockup workaround. */
+	return qcom_fg_write(chip, &peek_mux, GEN4_BATT_INFO_PEEK_MUX4, 1);
+}
+
+static int qcom_fg_gen4_parse_ntc(struct qcom_fg_chip *chip)
+{
+	struct device_node *node = chip->dev->of_node;
+	u32 coeffs[GEN4_BATT_THERM_COEFF_COUNT], center, pull_up;
+	int ret, i;
+
+	ret = of_property_read_u32_array(node, "qcom,fg-therm-coefficients",
+					 coeffs, ARRAY_SIZE(coeffs));
+	if (ret)
+		return dev_err_probe(chip->dev, ret,
+				     "Missing Gen4 thermistor coefficients\n");
+
+	if (of_property_count_u32_elems(node, "qcom,fg-therm-coefficients") !=
+	    GEN4_BATT_THERM_COEFF_COUNT)
+		return -EINVAL;
+
+	ret = of_property_read_u32(node, "qcom,fg-therm-center-offset", &center);
+	if (ret)
+		return dev_err_probe(chip->dev, ret,
+				     "Missing Gen4 thermistor center offset\n");
+
+	ret = of_property_read_u32(node, "qcom,fg-therm-pull-up-kohms", &pull_up);
+	if (ret)
+		return dev_err_probe(chip->dev, ret,
+				     "Missing Gen4 thermistor pull-up\n");
+
+	for (i = 0; i < ARRAY_SIZE(coeffs); i++) {
+		if (coeffs[i] > U16_MAX)
+			return -EINVAL;
+		chip->gen4_ntc_coeffs[i] = coeffs[i];
+	}
+	if (center > U8_MAX)
+		return -EINVAL;
+	chip->gen4_ntc_center = center;
+
+	switch (pull_up) {
+	case 30:
+		chip->gen4_ntc_pull_up = 1;
+		break;
+	case 100:
+		chip->gen4_ntc_pull_up = 2;
+		break;
+	case 400:
+		chip->gen4_ntc_pull_up = 3;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	chip->gen4_ntc_valid = true;
+	return 0;
+}
+
+static int qcom_fg_gen4_apply_ntc(struct qcom_fg_chip *chip)
+{
+	u8 coeffs[GEN4_BATT_THERM_COEFF_COUNT * 2];
+	u8 center = chip->gen4_ntc_center;
+	bool present;
+	int ret, i;
+
+	mutex_lock(&chip->gen4_ntc_lock);
+	chip->gen4_ntc_applied = false;
+	ret = qcom_fg_gen4_battery_present(chip, &present);
+	if (ret || !present)
+		goto out;
+
+	for (i = 0; i < GEN4_BATT_THERM_COEFF_COUNT; i++) {
+		coeffs[i * 2] = chip->gen4_ntc_coeffs[i] & 0xff;
+		coeffs[i * 2 + 1] = chip->gen4_ntc_coeffs[i] >> 8;
+	}
+
+	ret = qcom_fg_gen4_dma_transfer(chip, GEN4_BATT_THERM_COEFF_WORD, 0,
+					coeffs, sizeof(coeffs), true);
+	if (ret)
+		goto out;
+
+	ret = qcom_fg_gen4_dma_transfer(chip, GEN4_BATT_THERM_CENTER_WORD, 1,
+					&center, 1, true);
+	if (ret)
+		goto out;
+
+	ret = qcom_fg_masked_write(chip, GEN4_ADC_RR_BATT_THERM_CFG,
+				   GEN4_BATT_THERM_PULL_UP_MASK,
+				   chip->gen4_ntc_pull_up);
+	if (ret)
+		goto out;
+
+	ret = qcom_fg_gen4_battery_present(chip, &present);
+	if (!ret && present)
+		chip->gen4_ntc_applied = true;
+
+out:
+	mutex_unlock(&chip->gen4_ntc_lock);
+	return ret;
 }
 
 /************************
@@ -825,7 +1164,39 @@ static int qcom_fg_gen4_get_temperature(struct qcom_fg_chip *chip, int *val)
 {
 	int temp;
 	u8 readval[2];
+	bool present;
 	int ret;
+
+	if (chip->gen4_dma) {
+		mutex_lock(&chip->gen4_ntc_lock);
+		ret = qcom_fg_gen4_battery_present(chip, &present);
+		if (ret)
+			goto unlock;
+		if (!present || !chip->gen4_ntc_applied) {
+			ret = -ENODATA;
+			goto unlock;
+		}
+
+		ret = qcom_fg_gen4_dma_transfer(chip, GEN4_BATT_TEMP_WORD, 0,
+						readval, sizeof(readval), false);
+		if (ret)
+			goto unlock;
+
+		ret = qcom_fg_gen4_battery_present(chip, &present);
+		if (ret)
+			goto unlock;
+		if (!present) {
+			ret = -ENODATA;
+			goto unlock;
+		}
+
+		/* Signed 10-bit value, 0.25 degrees C per LSB. */
+		temp = sign_extend32(readval[0] | readval[1] << 8, 9);
+		*val = DIV_ROUND_CLOSEST(temp * 10, 4);
+unlock:
+		mutex_unlock(&chip->gen4_ntc_lock);
+		return ret;
+	}
 
 	ret = qcom_fg_read(chip, readval, ADC_RR_BATT_TEMP_LSB, 2);
 	if (ret) {
@@ -957,7 +1328,15 @@ static int qcom_fg_get_property(struct power_supply *psy,
 		val->intval = chip->batt_info->charge_full_design_uah;
 		break;
 	case POWER_SUPPLY_PROP_PRESENT:
-		val->intval = 1;
+		if (chip->gen4_dma) {
+			bool present;
+
+			ret = qcom_fg_gen4_battery_present(chip, &present);
+			if (!ret)
+				val->intval = present;
+		} else {
+			val->intval = 1;
+		}
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
 		ret = chip->ops->get_temperature(chip, &val->intval);
@@ -1110,6 +1489,32 @@ static irqreturn_t qcom_fg_handle_mem_avail(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+static irqreturn_t qcom_fg_gen4_handle_batt_missing(int irq, void *data)
+{
+	struct qcom_fg_chip *chip = data;
+	bool present;
+	int ret;
+
+	ret = qcom_fg_gen4_battery_present(chip, &present);
+	if (ret) {
+		dev_err(chip->dev, "Failed to read battery presence: %d\n", ret);
+		return IRQ_HANDLED;
+	}
+
+	if (!present) {
+		mutex_lock(&chip->gen4_ntc_lock);
+		chip->gen4_ntc_applied = false;
+		mutex_unlock(&chip->gen4_ntc_lock);
+	} else if (chip->gen4_ntc_valid) {
+		ret = qcom_fg_gen4_apply_ntc(chip);
+		if (ret)
+			dev_err(chip->dev, "Failed to restore Gen4 NTC: %d\n", ret);
+	}
+
+	power_supply_changed(chip->batt_psy);
+	return IRQ_HANDLED;
+}
+
 static void qcom_fg_status_changed_worker(struct work_struct *work)
 {
 	struct qcom_fg_chip *chip = container_of(work, struct qcom_fg_chip,
@@ -1131,8 +1536,8 @@ static int qcom_fg_notifier_call(struct notifier_block *nb, unsigned long val,
 						&propval);
 		if (ret)
 			chip->status = POWER_SUPPLY_STATUS_UNKNOWN;
-
-		chip->status = propval.intval;
+		else
+			chip->status = propval.intval;
 
 		power_supply_changed(chip->batt_psy);
 
@@ -1155,14 +1560,68 @@ static int qcom_fg_notifier_call(struct notifier_block *nb, unsigned long val,
 	return NOTIFY_OK;
 }
 
+static int qcom_fg_legacy_memif_init(struct qcom_fg_chip *chip)
+{
+	u8 dma_status;
+	bool error_present;
+	int ret;
+
+	/* Track IACS_READY rather than end-of-transaction. */
+	ret = qcom_fg_masked_write(chip, MEM_INTF_IMA_CFG(chip), BIT(3),
+				   BIT(3));
+	if (ret)
+		return ret;
+
+	ret = qcom_fg_clear_ima(chip, true);
+	if (ret && ret != -EAGAIN)
+		return ret;
+
+	ret = qcom_fg_read(chip, &dma_status, MEM_IF_DMA_STS(chip), 1);
+	if (ret)
+		return ret;
+
+	error_present = dma_status & (BIT(1) | BIT(2));
+	return qcom_fg_masked_write(chip, MEM_IF_DMA_CTL(chip), BIT(0),
+				    error_present ? BIT(0) : 0);
+}
+
+static void qcom_fg_put_battery_info(void *data)
+{
+	struct qcom_fg_chip *chip = data;
+
+	power_supply_put_battery_info(chip->batt_psy, chip->batt_info);
+}
+
+static void qcom_fg_put_charger(void *data)
+{
+	struct qcom_fg_chip *chip = data;
+
+	power_supply_put(chip->chg_psy);
+}
+
+static void qcom_fg_unregister_notifier(void *data)
+{
+	struct qcom_fg_chip *chip = data;
+
+	power_supply_unreg_notifier(&chip->nb);
+	cancel_delayed_work_sync(&chip->status_changed_work);
+}
+
+static void qcom_fg_destroy_sram_wq(void *data)
+{
+	struct qcom_fg_chip *chip = data;
+
+	cancel_delayed_work_sync(&chip->sram_release_access_work);
+	destroy_workqueue(chip->sram_wq);
+}
+
 static int qcom_fg_probe(struct platform_device *pdev)
 {
 	struct power_supply_config supply_config = {};
 	struct qcom_fg_chip *chip;
+	const struct qcom_spmi_pmic *pmic;
 	const __be32 *prop_addr;
 	int irq;
-	u8 dma_status;
-	bool error_present;
 	int ret;
 
 	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
@@ -1185,40 +1644,41 @@ static int qcom_fg_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 	chip->base = be32_to_cpu(*prop_addr);
+	chip->gen4_dma = chip->ops == &ops_fg_gen4 &&
+		of_property_read_bool(pdev->dev.of_node, "qcom,fg-gen4-dma");
 
-	/*
-	 * Change the FG_MEM_INT interrupt to track IACS_READY
-	 * condition instead of end-of-transaction. This makes sure
-	 * that the next transaction starts only after the hw is ready.
-	 * IACS_INTR_SRC_SLCT is BIT(3)
-	 */
-	ret = qcom_fg_masked_write(chip, MEM_INTF_IMA_CFG(chip), BIT(3),
-				   BIT(3));
-	if (ret) {
-		dev_err(chip->dev,
-			"Failed to configure interrupt sourete: %d\n", ret);
-		return ret;
-	}
+	if (chip->gen4_dma) {
+		if (chip->base != 0x4000)
+			return -EINVAL;
 
-	ret = qcom_fg_clear_ima(chip, true);
-	if (ret && ret != -EAGAIN) {
-		dev_err(chip->dev, "Failed to clear IMA exception: %d\n", ret);
-		return ret;
-	}
+		pmic = qcom_pmic_get(chip->dev);
+		if (IS_ERR(pmic))
+			return PTR_ERR(pmic);
+		if (pmic->subtype != PM8150B_SUBTYPE ||
+		    (pmic->major != 1 && pmic->major != 2))
+			return -ENODEV;
 
-	/* Check and clear DMA errors */
-	ret = qcom_fg_read(chip, &dma_status, MEM_IF_DMA_STS(chip), 1);
-	if (ret < 0) {
-		dev_err(chip->dev, "Failed to read dma_status: %d\n", ret);
-		return ret;
-	}
+		chip->gen4_v1 = pmic->major == 1;
+		mutex_init(&chip->gen4_dma_lock);
+		mutex_init(&chip->gen4_ntc_lock);
+		ret = qcom_fg_gen4_parse_ntc(chip);
+		if (ret)
+			return ret;
 
-	error_present = dma_status & (BIT(1) | BIT(2));
-	ret = qcom_fg_masked_write(chip, MEM_IF_DMA_CTL(chip), BIT(0),
-				   error_present ? BIT(0) : 0);
-	if (ret < 0) {
-		dev_err(chip->dev, "Failed to write dma_ctl: %d\n", ret);
-		return ret;
+		ret = qcom_fg_gen4_dma_init(chip);
+		if (ret)
+			return dev_err_probe(chip->dev, ret,
+					     "Failed to initialize Gen4 DMA MEMIF\n");
+
+		ret = qcom_fg_gen4_apply_ntc(chip);
+		if (ret)
+			return dev_err_probe(chip->dev, ret,
+					     "Failed to configure Gen4 NTC\n");
+	} else {
+		ret = qcom_fg_legacy_memif_init(chip);
+		if (ret)
+			return dev_err_probe(chip->dev, ret,
+					     "Failed to initialize legacy MEMIF\n");
 	}
 
 	supply_config.drv_data = chip;
@@ -1238,6 +1698,9 @@ static int qcom_fg_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Failed to get battery info: %d\n", ret);
 		return ret;
 	}
+	ret = devm_add_action_or_reset(chip->dev, qcom_fg_put_battery_info, chip);
+	if (ret)
+		return ret;
 
 	/* Initialize SRAM */
 	if (of_device_is_compatible(pdev->dev.of_node, "qcom,pmi8994-fg")) {
@@ -1253,8 +1716,14 @@ static int qcom_fg_probe(struct platform_device *pdev)
 		init_completion(&chip->sram_access_revoked);
 
 		chip->sram_wq = create_singlethread_workqueue("qcom_fg");
+		if (!chip->sram_wq)
+			return -ENOMEM;
 		INIT_DELAYED_WORK(&chip->sram_release_access_work,
 				  qcom_fg_sram_release_access_worker);
+		ret = devm_add_action_or_reset(chip->dev,
+					   qcom_fg_destroy_sram_wq, chip);
+		if (ret)
+			return ret;
 
 		ret = devm_request_threaded_irq(chip->dev, irq, NULL,
 						qcom_fg_handle_mem_avail,
@@ -1325,6 +1794,27 @@ static int qcom_fg_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	if (chip->gen4_dma) {
+		irq = of_irq_get_byname(pdev->dev.of_node, "batt-missing");
+		if (irq < 0)
+			return dev_err_probe(chip->dev, irq,
+					     "Missing Gen4 battery-presence IRQ\n");
+
+		ret = devm_request_threaded_irq(chip->dev, irq, NULL,
+						qcom_fg_gen4_handle_batt_missing,
+						IRQF_ONESHOT, "batt-missing", chip);
+		if (ret)
+			return dev_err_probe(chip->dev, ret,
+					     "Failed to request battery-presence IRQ\n");
+
+		/* Recheck even if the battery changed twice before IRQ setup. */
+		ret = qcom_fg_gen4_apply_ntc(chip);
+		if (ret)
+			dev_err(chip->dev,
+				"Failed to apply Gen4 NTC after IRQ setup: %d\n",
+				ret);
+	}
+
 	/* Optional: Get charger power supply for status checking */
 	chip->chg_psy = power_supply_get_by_reference(dev_fwnode(chip->dev),
 						    "power-supplies");
@@ -1335,6 +1825,11 @@ static int qcom_fg_probe(struct platform_device *pdev)
 	}
 
 	if (chip->chg_psy) {
+		ret = devm_add_action_or_reset(chip->dev, qcom_fg_put_charger,
+					   chip);
+		if (ret)
+			return ret;
+
 		INIT_DELAYED_WORK(&chip->status_changed_work,
 				  qcom_fg_status_changed_worker);
 
@@ -1345,19 +1840,14 @@ static int qcom_fg_probe(struct platform_device *pdev)
 				ret);
 			return ret;
 		}
+
+		ret = devm_add_action_or_reset(chip->dev,
+					   qcom_fg_unregister_notifier, chip);
+		if (ret)
+			return ret;
 	}
 
 	return 0;
-}
-
-static void qcom_fg_remove(struct platform_device *pdev)
-{
-	struct qcom_fg_chip *chip = platform_get_drvdata(pdev);
-
-	power_supply_put_battery_info(chip->batt_psy, chip->batt_info);
-
-	if (chip->sram_wq)
-		destroy_workqueue(chip->sram_wq);
 }
 
 static const struct of_device_id fg_match_id_table[] = {
@@ -1370,7 +1860,6 @@ MODULE_DEVICE_TABLE(of, fg_match_id_table);
 
 static struct platform_driver qcom_fg_driver = {
 	.probe = qcom_fg_probe,
-	.remove = qcom_fg_remove,
 	.driver = {
 		.name = "qcom-fg",
 		.of_match_table = fg_match_id_table,

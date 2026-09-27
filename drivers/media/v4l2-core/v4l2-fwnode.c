@@ -884,6 +884,12 @@ static int v4l2_fwnode_reference_parse(struct device *dev,
 	     index++) {
 		struct v4l2_async_connection *asd;
 
+		/* A disabled referenced device cannot register a subdev. */
+		if (!fwnode_device_is_available(args.fwnode)) {
+			fwnode_handle_put(args.fwnode);
+			continue;
+		}
+
 		asd = v4l2_async_nf_add_fwnode(notifier, args.fwnode,
 					       struct v4l2_async_connection);
 		fwnode_handle_put(args.fwnode);

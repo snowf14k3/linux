@@ -54,6 +54,12 @@ properties:
     maximum: 4800000
     multipleOf: 50000
 
+  qcom,secondary-charger-present:
+    description: |
+      The board has a secondary charger controlled by SMB_EN. Hold SMB_EN
+      inactive during probe until a coordinated charging policy owns it.
+    type: boolean
+
 required:
   - compatible
   - reg
@@ -74,6 +80,7 @@ allOf:
       properties:
         input-current-limit-microamp:
           maximum: 3000000
+        qcom,secondary-charger-present: false
   - if:
       properties:
         compatible:
@@ -84,6 +91,7 @@ allOf:
     then:
       properties:
         input-current-limit-microamp: false
+        qcom,secondary-charger-present: false
 
 additionalProperties: false
 

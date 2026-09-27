@@ -24,11 +24,13 @@
 #define SMB1390_VPH_OV_SOFT_BIT		BIT(7)
 
 #define SMB1390_CORE_STATUS2_REG		0x1007
+#define SMB1390_SWITCHER_HOLD_OFF_BIT	BIT(0)
 #define SMB1390_VPH_OV_HARD_BIT		BIT(1)
 #define SMB1390_TSD_BIT			BIT(2)
 #define SMB1390_IREV_BIT		BIT(3)
 #define SMB1390_IOC_BIT			BIT(4)
 #define SMB1390_VIN_OV_BIT		BIT(6)
+#define SMB1390_EN_PIN_OUT2_BIT		BIT(7)
 
 #define SMB1390_CORE_CONTROL1_REG	0x1020
 #define SMB1390_CMD_EN_SWITCHER_BIT	BIT(0)
@@ -110,6 +112,22 @@ static int smb1390_get_property(struct power_supply *psy,
 		return 0;
 
 	case POWER_SUPPLY_PROP_TEMP:
+		ret = regmap_read(chip->regmap, SMB1390_CORE_STATUS2_REG,
+				  &status2);
+		if (ret)
+			return ret;
+
+		ret = regmap_read(chip->regmap, SMB1390_CORE_CONTROL1_REG,
+				  &control);
+		if (ret)
+			return ret;
+
+		/* The ADC is not reliable while the charge pump is disabled. */
+		if (!(status2 & SMB1390_EN_PIN_OUT2_BIT) ||
+		    (status2 & SMB1390_SWITCHER_HOLD_OFF_BIT) ||
+		    !(control & SMB1390_CMD_EN_SWITCHER_BIT))
+			return -ENODATA;
+
 		ret = iio_read_channel_processed(chip->die_temp, &temp);
 		if (ret)
 			return ret;

@@ -182,6 +182,11 @@ enum smb_generation {
 #define BARK_BITE_WDOG_PET				0x643
 #define BARK_BITE_WDOG_PET_BIT				BIT(0)
 
+#define MISC_SMB_EN_CMD				0x648
+#define SMB_EN_OVERRIDE_VALUE_BIT		BIT(4)
+#define SMB_EN_OVERRIDE_BIT			BIT(3)
+#define EN_CP_CMD_BIT				BIT(0)
+
 #define WD_CFG						0x651
 #define WATCHDOG_TRIGGER_AFP_EN_BIT			BIT(7)
 #define BARK_WDOG_INT_EN_BIT				BIT(6)
@@ -258,6 +263,7 @@ struct smb_chip {
 	u8 usbin_i_ua_per_uv;
 	u32 current_step_ua;
 	u32 input_current_limit_ua;
+	bool fcc_limit_to_battery;
 	struct mutex input_lock;
 	bool input_config_failed;
 	bool input_ready;
@@ -288,6 +294,8 @@ static enum power_supply_property smb_properties[] = {
 	POWER_SUPPLY_PROP_MODEL_NAME,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
+	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
@@ -510,6 +518,70 @@ static inline int smb_get_current_limit(struct smb_chip *chip, int *val)
 
 	*val = raw * chip->current_step_ua;
 	return 0;
+}
+
+static int smb_get_fast_charge_current(struct smb_chip *chip, int *val)
+{
+	unsigned int raw;
+	int ret;
+
+	ret = regmap_read(chip->regmap,
+			  chip->base + FAST_CHARGE_CURRENT_CFG, &raw);
+	if (ret)
+		return ret;
+
+	*val = (raw & FAST_CHARGE_CURRENT_SETTING_MASK) *
+		chip->current_step_ua;
+	return 0;
+}
+
+static int smb_get_fast_charge_current_max(struct smb_chip *chip, int *val)
+{
+	if (!chip->fcc_limit_to_battery) {
+		*val = FAST_CHARGE_CURRENT_CAP_UA;
+		return 0;
+	}
+
+	if (!chip->batt_info ||
+	    chip->batt_info->constant_charge_current_max_ua <= 0)
+		return -EAGAIN;
+
+	*val = min_t(int, chip->batt_info->constant_charge_current_max_ua,
+		     FAST_CHARGE_CURRENT_CAP_UA);
+	return 0;
+}
+
+static int smb_set_fast_charge_current(struct smb_chip *chip, int val)
+{
+	int max_ua, ret;
+
+	/* Runtime FCC control is available only with a board USB input cap. */
+	if (!chip->fcc_limit_to_battery || !chip->input_current_limit_ua)
+		return -EOPNOTSUPP;
+
+	ret = smb_get_fast_charge_current_max(chip, &max_ua);
+	if (ret)
+		return ret;
+	if (val <= 0 || (u32)val < chip->current_step_ua ||
+	    val > max_ua || val % chip->current_step_ua)
+		return -EINVAL;
+
+	mutex_lock(&chip->input_lock);
+	if (!chip->input_ready || chip->input_config_failed) {
+		ret = chip->input_config_failed ? -EIO : -EAGAIN;
+		goto unlock;
+	}
+
+	ret = regmap_update_bits(chip->regmap,
+				 chip->base + FAST_CHARGE_CURRENT_CFG,
+				 FAST_CHARGE_CURRENT_SETTING_MASK,
+				 val / chip->current_step_ua);
+unlock:
+	mutex_unlock(&chip->input_lock);
+	if (!ret)
+		power_supply_changed(chip->chg_psy);
+
+	return ret;
 }
 
 static int smb_set_usb_suspend(struct smb_chip *chip, bool suspend)
@@ -845,6 +917,10 @@ static int smb_get_property(struct power_supply *psy,
 		return 0;
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return smb_get_current_limit(chip, &val->intval);
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+		return smb_get_fast_charge_current(chip, &val->intval);
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
+		return smb_get_fast_charge_current_max(chip, &val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		rc = smb_get_iio_chan(chip, chip->usb_in_i_chan,
 				       &val->intval);
@@ -884,6 +960,8 @@ static int smb_set_property(struct power_supply *psy,
 		return smb_set_charge_behaviour(chip, val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return smb_set_current_limit_request(chip, val->intval);
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+		return smb_set_fast_charge_current(chip, val->intval);
 	default:
 		dev_err(chip->dev, "No setter for property: %d\n", psp);
 		return -EINVAL;
@@ -893,7 +971,12 @@ static int smb_set_property(struct power_supply *psy,
 static int smb_property_is_writable(struct power_supply *psy,
 				     enum power_supply_property psp)
 {
+	struct smb_chip *chip = power_supply_get_drvdata(psy);
+
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+		return chip->fcc_limit_to_battery &&
+		       !!chip->input_current_limit_ua;
 	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return 1;
@@ -1253,6 +1336,34 @@ static int smb_prepare_charge_current(struct smb_chip *chip)
 	return 0;
 }
 
+static int smb_prepare_secondary_charger(struct smb_chip *chip)
+{
+	unsigned int status;
+	unsigned int mask = SMB_EN_OVERRIDE_VALUE_BIT |
+			    SMB_EN_OVERRIDE_BIT | EN_CP_CMD_BIT;
+	int ret;
+
+	/* Keep SMB_EN low until a policy can safely hand off to the pump. */
+	ret = regmap_update_bits(chip->regmap, chip->base + MISC_SMB_EN_CMD,
+				 mask, SMB_EN_OVERRIDE_BIT);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(chip->regmap, chip->base + MISC_SMB_EN_CMD,
+			  &status);
+	if (ret)
+		return ret;
+
+	return (status & mask) == SMB_EN_OVERRIDE_BIT ? 0 : -EIO;
+}
+
+static void smb_put_battery_info(void *data)
+{
+	struct smb_chip *chip = data;
+
+	power_supply_put_battery_info(chip->chg_psy, chip->batt_info);
+}
+
 static int smb_probe(struct platform_device *pdev)
 {
 	struct power_supply_config supply_config = {};
@@ -1282,6 +1393,7 @@ static int smb_probe(struct platform_device *pdev)
 	match_data = (const struct smb_match_data *)device_get_match_data(chip->dev);
 
 	chip->gen = match_data->gen;
+	chip->fcc_limit_to_battery = match_data->limit_fcc_to_battery;
 	chip->usbin_i_ua_per_uv = match_data->usbin_i_ua_per_uv ?
 				    match_data->usbin_i_ua_per_uv : 1;
 	chip->current_step_ua = match_data->current_step_ua;
@@ -1294,6 +1406,24 @@ static int smb_probe(struct platform_device *pdev)
 		rc = smb_prepare_charge_current(chip);
 		if (rc)
 			return rc;
+	}
+	if (device_property_read_bool(chip->dev,
+				      "qcom,secondary-charger-present")) {
+		if (!match_data->limit_fcc_to_battery)
+			return dev_err_probe(chip->dev, -EINVAL,
+					     "unsupported secondary charger control\n");
+
+		rc = smb_prepare_secondary_charger(chip);
+		if (rc) {
+			int suspend_rc = smb_set_usb_suspend(chip, true);
+
+			if (suspend_rc)
+				dev_err(chip->dev,
+					"could not suspend USB after SMB_EN failure: %d\n",
+					suspend_rc);
+			return dev_err_probe(chip->dev, rc,
+					     "could not hold secondary charger off\n");
+		}
 	}
 
 	chip->usb_in_v_chan = devm_iio_channel_get(chip->dev, "usbin_v");
@@ -1383,6 +1513,9 @@ static int smb_probe(struct platform_device *pdev)
 	if (rc)
 		return dev_err_probe(chip->dev, rc,
 				     "Failed to get battery info\n");
+	rc = devm_add_action_or_reset(chip->dev, smb_put_battery_info, chip);
+	if (rc)
+		return rc;
 	if (chip->batt_info->constant_charge_current_max_ua == -EINVAL)
 		chip->batt_info->constant_charge_current_max_ua = DCP_CURRENT_UA;
 	if (match_data->limit_fcc_to_battery &&

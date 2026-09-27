@@ -18,6 +18,7 @@
 #include <linux/of_graph.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_domain.h>
+#include <linux/property.h>
 #include <linux/slab.h>
 #include <linux/videodev2.h>
 
@@ -1837,7 +1838,8 @@ static const struct camss_subdev_resources vfe_res_8150[] = {
 			.line_num = 3,
 			.hw_ops = &vfe_ops_170,
 			.formats_rdi = &vfe_formats_rdi_845,
-			.formats_pix = &vfe_formats_pix_845,
+			.formats_pix = &vfe_formats_pix_8150,
+			.formats_pix_sink = &vfe_formats_pix_sink_8150,
 		},
 	},
 	{
@@ -1858,7 +1860,8 @@ static const struct camss_subdev_resources vfe_res_8150[] = {
 			.line_num = 3,
 			.hw_ops = &vfe_ops_170,
 			.formats_rdi = &vfe_formats_rdi_845,
-			.formats_pix = &vfe_formats_pix_845,
+			.formats_pix = &vfe_formats_pix_8150,
+			.formats_pix_sink = &vfe_formats_pix_sink_8150,
 		},
 	},
 	{
@@ -4664,6 +4667,16 @@ static int camss_parse_ports(struct camss *camss)
 
 	fwnode_graph_for_each_endpoint(fwnode, ep) {
 		struct camss_async_subdev *csd;
+		struct fwnode_handle *remote;
+
+		remote = fwnode_graph_get_remote_port_parent(ep);
+		if (remote) {
+			bool available = fwnode_device_is_available(remote);
+
+			fwnode_handle_put(remote);
+			if (!available)
+				continue;
+		}
 
 		csd = v4l2_async_nf_add_fwnode_remote(&camss->notifier, ep,
 						      typeof(*csd));

@@ -94,6 +94,8 @@ struct vfe_line {
 	struct vfe_output output;
 	const struct camss_format_info *formats;
 	unsigned int nformats;
+	const struct camss_format_info *sink_formats;
+	unsigned int nsink_formats;
 };
 
 struct vfe_device;
@@ -141,6 +143,7 @@ struct vfe_subdev_resources {
 	const struct vfe_hw_ops *hw_ops;
 	const struct camss_formats *formats_rdi;
 	const struct camss_formats *formats_pix;
+	const struct camss_formats *formats_pix_sink;
 };
 
 struct vfe_device {
@@ -191,6 +194,8 @@ void msm_vfe_unregister_entities(struct vfe_device *vfe);
 void vfe_buf_add_pending(struct vfe_output *output, struct camss_buffer *buffer);
 
 struct camss_buffer *vfe_buf_get_pending(struct vfe_output *output);
+void vfe_wm_update_buffer(struct vfe_device *vfe, struct vfe_line *line,
+			  struct camss_buffer *buf);
 
 int vfe_flush_buffers(struct camss_video *vid, enum vb2_buffer_state state);
 
@@ -240,6 +245,8 @@ extern const struct camss_formats vfe_formats_rdi_8x96;
 extern const struct camss_formats vfe_formats_pix_8x96;
 extern const struct camss_formats vfe_formats_rdi_845;
 extern const struct camss_formats vfe_formats_pix_845;
+extern const struct camss_formats vfe_formats_pix_8150;
+extern const struct camss_formats vfe_formats_pix_sink_8150;
 
 extern const struct vfe_hw_ops vfe_ops_4_1;
 extern const struct vfe_hw_ops vfe_ops_4_7;

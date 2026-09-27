@@ -718,6 +718,7 @@
 	status = "okay";
 	monitored-battery = <&battery>;
 	input-current-limit-microamp = <1500000>;
+	qcom,secondary-charger-present;
 };
 
 &pm8150b_vbus {
