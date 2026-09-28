@@ -10,6 +10,9 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/math64.h>
+
+#include <media/videobuf2-core.h>
 
 #include "camss.h"
 #include "camss-vfe.h"
@@ -39,6 +42,7 @@
 #define VFE_MODULE_ZOOM_EN			(0x04c)
 #define		ZOOM_CST_EN			BIT(0)
 #define		ZOOM_SCALE_VID_EN		BIT(3)
+#define		ZOOM_CROP_VID_EN		BIT(4)
 
 #define VFE_CORE_CFG				(0x050)
 #define		CFG_PIXEL_PATTERN_MASK		GENMASK(2, 0)
@@ -82,6 +86,7 @@
 #define		STATUS_0_RESET_ACK			BIT(31)
 
 #define VFE_IRQ_STATUS_1				(0x070)
+#define		STATUS_1_CAMIF_ERROR			BIT(0)
 #define		STATUS_1_VIOLATION			BIT(7)
 #define		STATUS_1_BUS_BDG_HALT_ACK		BIT(8)
 #define		STATUS_1_RDI_SOF(n)			BIT((n) + 27)
@@ -143,11 +148,16 @@
 #define		MNDS_PHASE_SHIFT		14
 
 #define VFE_FULL_Y_CROP_RND_CLAMP_CFG		(0xe0c)
+#define VFE_FULL_Y_CROP_LINE_CFG			(0xe10)
+#define VFE_FULL_Y_CROP_PIXEL_CFG		(0xe14)
 #define VFE_FULL_Y_CH0_CLAMP_CFG			(0xe18)
 #define VFE_FULL_Y_CH0_ROUNDING_CFG		(0xe1c)
 #define VFE_FULL_C_CROP_RND_CLAMP_CFG		(0xe2c)
+#define VFE_FULL_C_CROP_LINE_CFG			(0xe30)
+#define VFE_FULL_C_CROP_PIXEL_CFG		(0xe34)
 #define VFE_FULL_C_CH0_CLAMP_CFG			(0xe38)
 #define VFE_FULL_C_CH0_ROUNDING_CFG		(0xe3c)
+#define		FULL_CROP_EN			BIT(9)
 #define		FULL_ROUND_CLAMP_EN		(BIT(10) | BIT(11))
 #define		FULL_CLAMP_8BIT		(0xff << 20)
 #define		FULL_ROUND_10_TO_8		((3 << 1) | (2 << 3))
@@ -442,6 +452,7 @@ static irqreturn_t vfe_isr(int irq, void *dev)
 {
 	struct vfe_device *vfe = dev;
 	u32 status0, status1, vfe_bus_status[VFE_BUS_IRQ_REG_NUM];
+	bool pix_active;
 	int i, wm;
 
 	status0 = readl_relaxed(vfe->base + VFE_IRQ_STATUS_0);
@@ -464,6 +475,22 @@ static irqreturn_t vfe_isr(int irq, void *dev)
 
 	if (status0 & STATUS_0_RESET_ACK)
 		vfe->isr_ops.reset_ack(vfe);
+
+	pix_active = vfe_is_sm8150_pix(vfe, VFE_LINE_PIX) &&
+		     vfe->wm_output_map[VFE175_WM_PIX_Y] == VFE_LINE_PIX &&
+		     vfe->wm_output_map[VFE175_WM_PIX_C] == VFE_LINE_PIX;
+	if (pix_active &&
+	    ((status1 & (STATUS_1_CAMIF_ERROR |
+			    STATUS_1_VIOLATION)) ||
+	     (vfe_bus_status[0] & (STATUS0_COMP_ERROR |
+					   STATUS0_COMP_OVERWRITE |
+					   STATUS0_OVERFLOW |
+					   STATUS0_VIOLATION)))) {
+		dev_err_ratelimited(vfe->camss->dev,
+				    "SM8150 PIX error: core=0x%08x bus=0x%08x\n",
+				    status1, vfe_bus_status[0]);
+		vb2_queue_error(&vfe->line[VFE_LINE_PIX].video_out.vb2_q);
+	}
 
 	for (i = VFE_LINE_RDI0; i < vfe->res->line_num; i++)
 		if (status0 & (vfe_is_sm8150_pix(vfe, i) ?
@@ -548,25 +575,43 @@ error:
 	return -EINVAL;
 }
 
-static void vfe_pix_configure_mnds(struct vfe_device *vfe,
-				   u32 width, u32 height)
+static u32 vfe_pix_phase(u32 input, u32 output)
 {
-	u32 h_in = width - 1, v_in = height - 1;
-	u32 h_chroma_out = width / 2 - 1;
-	u32 v_chroma_out = height / 2 - 1;
-	/* Q14 phases with interpolation resolution 3: Y 1:1, C 2:1. */
-	u32 phase_y = (MNDS_INTERP_RESO << 28) |
-		(1U << (MNDS_INTERP_RESO + MNDS_PHASE_SHIFT));
-	u32 phase_c = (MNDS_INTERP_RESO << 28) |
-		(1U << (MNDS_INTERP_RESO + MNDS_PHASE_SHIFT + 1));
+	u32 ratio = input / output;
+	u32 resolution = MNDS_INTERP_RESO;
+	u32 multiplier;
+
+	if (ratio >= 16)
+		resolution = 0;
+	else if (ratio >= 8)
+		resolution = 1;
+	else if (ratio >= 4)
+		resolution = 2;
+
+	multiplier = div_u64((u64)input <<
+			     (resolution + MNDS_PHASE_SHIFT), output);
+
+	return (resolution << 28) | multiplier;
+}
+
+static void vfe_pix_configure_mnds(struct vfe_device *vfe,
+				   u32 in_width, u32 in_height,
+				   u32 out_width, u32 out_height)
+{
+	u32 h_in = in_width - 1, v_in = in_height - 1;
+	u32 h_y_out = out_width - 1, v_y_out = out_height - 1;
+	u32 h_c_out = out_width / 2 - 1, v_c_out = out_height / 2 - 1;
 	u32 y_regs[] = {
-		MNDS_HV_EN, h_in | (h_in << 16), phase_y, 0, 0, h_in,
-		v_in | (v_in << 16), phase_y, 0, 0, v_in,
+		MNDS_HV_EN, h_in | (h_y_out << 16),
+		vfe_pix_phase(in_width, out_width), 0, 0, h_in,
+		v_in | (v_y_out << 16),
+		vfe_pix_phase(in_height, out_height), 0, 0, v_in,
 	};
 	u32 c_regs[] = {
-		MNDS_HV_EN, h_in | (h_chroma_out << 16),
-		phase_c, 0, 0, h_in,
-		v_in | (v_chroma_out << 16), phase_c, 0, 0, v_in,
+		MNDS_HV_EN, h_in | (h_c_out << 16),
+		vfe_pix_phase(in_width, out_width / 2), 0, 0, h_in,
+		v_in | (v_c_out << 16),
+		vfe_pix_phase(in_height, out_height / 2), 0, 0, v_in,
 	};
 	unsigned int i;
 
@@ -578,8 +623,37 @@ static void vfe_pix_configure_mnds(struct vfe_device *vfe,
 			       vfe->base + VFE_SCALE_VID_C_CFG + i * 4);
 }
 
-static void vfe_pix_configure_yuv(struct vfe_device *vfe,
+static bool vfe_pix_configure_crop(struct vfe_device *vfe,
+				   const struct v4l2_rect *crop,
 				   u32 width, u32 height)
+{
+	bool enabled = crop->left || crop->top ||
+		       crop->width != width || crop->height != height;
+	u32 flags = FULL_ROUND_CLAMP_EN | (enabled ? FULL_CROP_EN : 0);
+	u32 first_line = crop->top;
+	u32 last_line = crop->top + crop->height - 1;
+	u32 first_pixel = crop->left;
+	u32 last_pixel = crop->left + crop->width - 1;
+
+	writel_relaxed((first_line << 16) | last_line,
+		       vfe->base + VFE_FULL_Y_CROP_LINE_CFG);
+	writel_relaxed((first_pixel << 16) | last_pixel,
+		       vfe->base + VFE_FULL_Y_CROP_PIXEL_CFG);
+	writel_relaxed(((first_line / 2) << 16) |
+		       ((last_line + 1) / 2 - 1),
+		       vfe->base + VFE_FULL_C_CROP_LINE_CFG);
+	writel_relaxed((first_pixel << 16) | last_pixel,
+		       vfe->base + VFE_FULL_C_CROP_PIXEL_CFG);
+	writel_relaxed(flags, vfe->base + VFE_FULL_Y_CROP_RND_CLAMP_CFG);
+	writel_relaxed(flags, vfe->base + VFE_FULL_C_CROP_RND_CLAMP_CFG);
+
+	return enabled;
+}
+
+static void vfe_pix_configure_yuv(struct vfe_device *vfe,
+				   u32 in_width, u32 in_height,
+				   u32 out_width, u32 out_height,
+				   const struct v4l2_rect *crop)
 {
 	/* Full-range BT.601 RGB to YCbCr, fixed-point coefficients. */
 	static const u32 cst[] = {
@@ -587,26 +661,27 @@ static void vfe_pix_configure_yuv(struct vfe_device *vfe,
 		0x01fe1eae, 0x00001f54, 0x02000000, 0x03ff0000,
 		0x1fad1e55, 0x000001fe, 0x02000000, 0x03ff0000,
 	};
+	bool crop_enabled;
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(cst); i++)
 		writel_relaxed(cst[i],
 			       vfe->base + VFE_COLOR_XFORM_BASE + i * 4);
 
-	writel_relaxed(FULL_ROUND_CLAMP_EN,
-		       vfe->base + VFE_FULL_Y_CROP_RND_CLAMP_CFG);
+	crop_enabled = vfe_pix_configure_crop(vfe, crop,
+					      out_width, out_height);
 	writel_relaxed(FULL_CLAMP_8BIT,
 		       vfe->base + VFE_FULL_Y_CH0_CLAMP_CFG);
 	writel_relaxed(FULL_ROUND_10_TO_8,
 		       vfe->base + VFE_FULL_Y_CH0_ROUNDING_CFG);
-	writel_relaxed(FULL_ROUND_CLAMP_EN,
-		       vfe->base + VFE_FULL_C_CROP_RND_CLAMP_CFG);
 	writel_relaxed(FULL_CLAMP_8BIT,
 		       vfe->base + VFE_FULL_C_CH0_CLAMP_CFG);
 	writel_relaxed(FULL_ROUND_10_TO_8 | BIT(0),
 		       vfe->base + VFE_FULL_C_CH0_ROUNDING_CFG);
-	vfe_pix_configure_mnds(vfe, width, height);
-	writel_relaxed(ZOOM_CST_EN | ZOOM_SCALE_VID_EN,
+	vfe_pix_configure_mnds(vfe, in_width, in_height,
+				out_width, out_height);
+	writel_relaxed(ZOOM_CST_EN | ZOOM_SCALE_VID_EN |
+		       (crop_enabled ? ZOOM_CROP_VID_EN : 0),
 		       vfe->base + VFE_MODULE_ZOOM_EN);
 }
 
@@ -617,16 +692,30 @@ static int vfe_pix_configure_frontend(struct vfe_line *line)
 		&line->fmt[MSM_VFE_PAD_SINK];
 	const struct v4l2_pix_format_mplane *pix =
 		&line->video_out.active_fmt.fmt.pix_mp;
+	const struct v4l2_rect *compose = &line->compose;
+	const struct v4l2_rect *crop = &line->crop;
 	u32 core_cfg, pattern, even, odd;
 	u32 unity_gain = DEMUX_UNITY_Q10 |
 			 (DEMUX_UNITY_Q10 << 16);
 	u32 unity_wb = WB_UNITY_Q7 | (WB_UNITY_Q7 << 16);
 
-	/* The initial path has full-frame luma and 2x2 chroma subsampling. */
-	if (fmt->width < 2 || fmt->height < 2 ||
+	/* MNDS scales the full RAW frame; FULL crops its NV12/NV21 output. */
+	if (fmt->width < 16 || fmt->height < 4 ||
 	    fmt->width > 0x3fff || fmt->height > 0x3fff ||
 	    (fmt->width & 1) || (fmt->height & 1) ||
-	    pix->width != fmt->width || pix->height != fmt->height)
+	    compose->left || compose->top ||
+	    compose->width < 16 || compose->height < 4 ||
+	    compose->width > fmt->width || compose->height > fmt->height ||
+	    (compose->width & 1) || (compose->height & 1) ||
+	    fmt->width > compose->width * 16 ||
+	    fmt->height > compose->height * 16 ||
+	    crop->left < 0 || crop->top < 0 ||
+	    crop->width < 16 || crop->height < 4 ||
+	    crop->left + crop->width > compose->width ||
+	    crop->top + crop->height > compose->height ||
+	    ((crop->left | crop->top | crop->width | crop->height) & 1) ||
+	    (crop->width & 15) ||
+	    pix->width != crop->width || pix->height != crop->height)
 		return -EINVAL;
 
 	switch (fmt->code) {
@@ -681,7 +770,8 @@ static int vfe_pix_configure_frontend(struct vfe_line *line)
 	writel_relaxed(LENS_DEMUX_EN | LENS_DEMO_EN,
 		       vfe->base + VFE_MODULE_LENS_EN);
 	writel_relaxed(0, vfe->base + VFE_MODULE_COLOR_EN);
-	vfe_pix_configure_yuv(vfe, fmt->width, fmt->height);
+	vfe_pix_configure_yuv(vfe, fmt->width, fmt->height,
+			      compose->width, compose->height, crop);
 
 	writel_relaxed(0, vfe->base + VFE_CAMIF_LINE_SKIP_PATTERN);
 	writel_relaxed(0, vfe->base + VFE_CAMIF_PIXEL_SKIP_PATTERN);
@@ -742,6 +832,10 @@ static int vfe_enable(struct vfe_line *line)
 		return -EINVAL;
 
 	mutex_lock(&vfe->stream_lock);
+	if (READ_ONCE(vfe->reset_failed)) {
+		mutex_unlock(&vfe->stream_lock);
+		return -EIO;
+	}
 
 	if (!vfe->stream_count)
 		vfe_enable_irq_common(vfe);

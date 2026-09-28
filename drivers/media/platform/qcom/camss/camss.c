@@ -1756,13 +1756,14 @@ static const struct camss_subdev_resources csiphy_res_8150[] = {
 	},
 };
 
+/* Full CSIDs enable the shared VFE clock; the parent VFE owns its rate. */
 static const struct camss_subdev_resources csid_res_8150[] = {
 	{
 		.regulators = {},
 		.clock = { "vfe0_csid", "vfe0_cphy_rx", "vfe0", "vfe0_axi" },
 		.clock_rate = { { 400000000, 480000000, 600000000 },
 				{ 400000000 },
-				{ 400000000, 558000000, 637000000 },
+				{ 0 },
 				{ 0 } },
 		.reg = { "csid0" },
 		.interrupt = { "csid0" },
@@ -1777,7 +1778,7 @@ static const struct camss_subdev_resources csid_res_8150[] = {
 		.clock = { "vfe1_csid", "vfe1_cphy_rx", "vfe1", "vfe1_axi" },
 		.clock_rate = { { 400000000, 480000000, 600000000 },
 				{ 400000000 },
-				{ 400000000, 558000000, 637000000 },
+				{ 0 },
 				{ 0 } },
 		.reg = { "csid1" },
 		.interrupt = { "csid1" },
@@ -1828,7 +1829,8 @@ static const struct camss_subdev_resources vfe_res_8150[] = {
 		.clock_rate = { { 0 }, { 0 }, { 0 }, { 0 },
 				{ 320000000, 400000000, 480000000 },
 				{ 0 }, { 80000000 },
-				{ 400000000, 558000000, 637000000 },
+				{ 400000000, 558000000, 637000000,
+				  847000000, 950000000 },
 				{ 0 } },
 		.reg = { "vfe0" },
 		.interrupt = { "vfe0" },
@@ -1850,7 +1852,8 @@ static const struct camss_subdev_resources vfe_res_8150[] = {
 		.clock_rate = { { 0 }, { 0 }, { 0 }, { 0 },
 				{ 320000000, 400000000, 480000000 },
 				{ 0 }, { 80000000 },
-				{ 400000000, 558000000, 637000000 },
+				{ 400000000, 558000000, 637000000,
+				  847000000, 950000000 },
 				{ 0 } },
 		.reg = { "vfe1" },
 		.interrupt = { "vfe1" },

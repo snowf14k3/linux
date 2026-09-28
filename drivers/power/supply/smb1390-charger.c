@@ -7,6 +7,7 @@
  * after the main charger and USB input policy pass their checks.
  */
 
+#include <linux/atomic.h>
 #include <linux/bitops.h>
 #include <linux/err.h>
 #include <linux/delay.h>
@@ -121,6 +122,7 @@ struct smb1390 {
 	bool policy_active;
 	bool policy_faulted;
 	bool pps_owned;
+	atomic_t ilim_irq_pending;
 	u32 target_vbus_uv;
 	u32 target_input_ua;
 	u32 max_input_ua;
@@ -286,6 +288,8 @@ static irqreturn_t smb1390_fault_irq(int irq, void *data)
 		goto fail;
 	}
 	if (!(latched & SMB1390_FAULT_IRQ_MASK)) {
+		if (latched & SMB1390_ILIM_IRQ_BIT)
+			atomic_set(&chip->ilim_irq_pending, 1);
 		power_supply_changed(chip->psy);
 		if (READ_ONCE(chip->policy_enabled))
 			mod_delayed_work(system_wq, &chip->policy_work, 0);
@@ -734,6 +738,8 @@ static int smb1390_policy_start(struct smb1390 *chip,
 	if (ret || online != SMB1390_FIXED_ONLINE)
 		return ret ? ret : -EBUSY;
 
+	/* Discard an idle-state ILIM event before beginning PPS negotiation. */
+	atomic_set(&chip->ilim_irq_pending, 0);
 	/* An attempted negotiation must be rolled back even after a timeout. */
 	chip->pps_owned = true;
 	ret = smb1390_psy_set_int(chip->pd_psy, POWER_SUPPLY_PROP_ONLINE,
@@ -873,7 +879,33 @@ static int smb1390_policy_start(struct smb1390 *chip,
 	ret = smb1390_policy_precheck(chip, &fresh);
 	if (ret)
 		return ret;
-	if (abs(fresh.vbat_uv - data->vbat_uv) > 150000)
+	if (abs(fresh.vbat_uv - data->vbat_uv) > 150000 ||
+	    fresh.main_icl_ua < (int)target_ua - 50000)
+		return -EAGAIN;
+
+	/* The ICL wait can last three seconds; verify the contract again. */
+	ret = smb1390_psy_get_int(chip->pd_psy, POWER_SUPPLY_PROP_ONLINE,
+				   &online);
+	if (ret || online != SMB1390_PPS_ONLINE)
+		return ret ? ret : -ENODEV;
+	ret = smb1390_psy_get_int(chip->pd_psy,
+				   POWER_SUPPLY_PROP_VOLTAGE_NOW, &pd_uv);
+	if (ret)
+		return ret;
+	ret = smb1390_psy_get_int(chip->pd_psy,
+				   POWER_SUPPLY_PROP_CURRENT_NOW, &pd_ua);
+	if (ret)
+		return ret;
+	if (abs(pd_uv - (int)target_uv) > SMB1390_POLICY_PD_TOLERANCE_UV ||
+	    pd_ua < (int)target_ua - 50000)
+		return -EAGAIN;
+	ret = smb1390_psy_get_int(chip->main_psy,
+				   POWER_SUPPLY_PROP_VOLTAGE_NOW, &main_uv);
+	if (ret || abs(main_uv - (int)target_uv) >
+	    SMB1390_POLICY_VBUS_TOLERANCE_UV ||
+	    READ_ONCE(chip->irq_faulted))
+		return ret ? ret : -EIO;
+	if (atomic_read(&chip->ilim_irq_pending))
 		return -EAGAIN;
 
 	ilim_ua = min(target_ua * 5 / 4, (u32)SMB1390_ILIM_MAX_UA);
@@ -926,7 +958,7 @@ static int smb1390_policy_monitor(struct smb1390 *chip,
 {
 	int online, pd_uv, pd_ua, main_uv, main_ua, die_temp, ret;
 	unsigned int status1;
-	bool switcher_on;
+	bool switcher_on, ilim_irq;
 	int target_uv;
 
 	ret = smb1390_psy_get_int(chip->pd_psy, POWER_SUPPLY_PROP_ONLINE,
@@ -969,10 +1001,12 @@ static int smb1390_policy_monitor(struct smb1390 *chip,
 	ret = regmap_read(chip->regmap, SMB1390_CORE_STATUS1_REG, &status1);
 	if (ret)
 		return ret;
-	if (status1 & SMB1390_ILIM_BIT) {
+	ilim_irq = atomic_xchg(&chip->ilim_irq_pending, 0);
+	if ((status1 & SMB1390_ILIM_BIT) || ilim_irq) {
 		chip->ilim_retries++;
 		return chip->ilim_retries >= 3 ? -EIO : -EAGAIN;
 	}
+	chip->ilim_retries = 0;
 	ret = iio_read_channel_processed(chip->die_temp, &die_temp);
 	if (ret || die_temp < -20000 ||
 	    die_temp > SMB1390_POLICY_MAX_DIE_MC)
@@ -1054,13 +1088,15 @@ schedule:
 		mod_delayed_work(system_wq, &chip->policy_work,
 				 msecs_to_jiffies(delay_ms));
 		/*
-		 * A fault IRQ can race with the periodic rearm above. Preserve
-		 * its immediate rollback request, but do not spin if rollback
-		 * already failed and left PPS ownership pending.
+		 * IRQs can race with the periodic rearm above. Preserve an
+		 * immediate fault rollback or a pending ILIM sample.
 		 */
 		if (READ_ONCE(chip->irq_faulted) &&
 		    (chip->policy_active || chip->pps_owned) &&
 		    !chip->policy_faulted)
+			mod_delayed_work(system_wq, &chip->policy_work, 0);
+		if (atomic_read(&chip->ilim_irq_pending) &&
+		    chip->policy_active)
 			mod_delayed_work(system_wq, &chip->policy_work, 0);
 	}
 unlock:
@@ -1144,6 +1180,7 @@ static int smb1390_probe(struct i2c_client *client)
 		return dev_err_probe(chip->dev, -EINVAL,
 				     "PPS policy needs all supply references\n");
 	mutex_init(&chip->policy_lock);
+	atomic_set(&chip->ilim_irq_pending, 0);
 	INIT_DELAYED_WORK(&chip->policy_work, smb1390_policy_work);
 	if (chip->main_psy) {
 		ret = qcom_smbx_set_charge_pump(chip->main_psy, false);

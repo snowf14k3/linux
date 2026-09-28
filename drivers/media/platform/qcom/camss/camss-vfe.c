@@ -11,6 +11,7 @@
 #include <linux/completion.h>
 #include <linux/interrupt.h>
 #include <linux/iommu.h>
+#include <linux/math64.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -662,6 +663,10 @@ int vfe_enable_v2(struct vfe_line *line)
 	int ret;
 
 	mutex_lock(&vfe->stream_lock);
+	if (READ_ONCE(vfe->reset_failed)) {
+		mutex_unlock(&vfe->stream_lock);
+		return -EIO;
+	}
 
 	if (vfe->res->hw_ops->enable_irq)
 		ops->enable_irq(vfe);
@@ -891,10 +896,11 @@ int vfe_disable(struct vfe_line *line)
 
 	mutex_lock(&vfe->stream_lock);
 	ret = vfe_disable_output(line);
-	if (!ret) {
-		vfe_put_output(line);
-		vfe->stream_count--;
-	}
+	/* WMs are off; reject reuse until a later power-on reset succeeds. */
+	if (ret)
+		WRITE_ONCE(vfe->reset_failed, true);
+	vfe_put_output(line);
+	vfe->stream_count--;
 	mutex_unlock(&vfe->stream_lock);
 
 	return ret;
@@ -987,6 +993,42 @@ static bool vfe_check_clock_levels(struct camss_clock *clock)
 	return false;
 }
 
+static int vfe_get_input_pixel_rate(struct vfe_line *line, u64 *rate)
+{
+	struct vfe_device *vfe = to_vfe(line);
+	struct media_pad *pad;
+	struct v4l2_subdev *sd;
+	struct csid_device *csid;
+	s64 link_freq;
+	u8 bpp;
+
+	if (vfe->camss->res->version != CAMSS_8150 ||
+	    !vfe_line_is_pix(vfe, line->id))
+		return camss_get_pixel_clock(&line->subdev.entity, rate);
+
+	pad = media_pad_remote_pad_first(&line->pads[MSM_VFE_PAD_SINK]);
+	if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
+		return -ENOLINK;
+	sd = media_entity_to_v4l2_subdev(pad->entity);
+	csid = v4l2_get_subdevdata(sd);
+	if (!csid || !csid->phy.lane_cnt)
+		return -ENOLINK;
+
+	bpp = camss_format_get_bpp(line->sink_formats, line->nsink_formats,
+				   line->fmt[MSM_VFE_PAD_SINK].code);
+	if (!bpp)
+		return -EINVAL;
+
+	link_freq = camss_get_link_freq(&line->subdev.entity, bpp,
+					csid->phy.lane_cnt);
+	if (link_freq < 0)
+		return link_freq;
+
+	/* The sensor's internal pixel rate includes non-transmitted blanking. */
+	*rate = div_u64((u64)link_freq * 2 * csid->phy.lane_cnt, bpp);
+	return 0;
+}
+
 /*
  * vfe_set_clock_rates - Calculate and set clock rates on VFE module
  * @vfe: VFE device
@@ -1001,8 +1043,8 @@ static int vfe_set_clock_rates(struct vfe_device *vfe)
 	int ret;
 
 	for (i = VFE_LINE_RDI0; i < vfe->res->line_num; i++) {
-		ret = camss_get_pixel_clock(&vfe->line[i].subdev.entity,
-					    &pixel_clock[i]);
+		ret = vfe_get_input_pixel_rate(&vfe->line[i],
+					       &pixel_clock[i]);
 		if (ret)
 			pixel_clock[i] = 0;
 	}
@@ -1082,8 +1124,8 @@ static int vfe_check_clock_rates(struct vfe_device *vfe)
 	int ret;
 
 	for (i = VFE_LINE_RDI0; i < vfe->res->line_num; i++) {
-		ret = camss_get_pixel_clock(&vfe->line[i].subdev.entity,
-					    &pixel_clock[i]);
+		ret = vfe_get_input_pixel_rate(&vfe->line[i],
+					       &pixel_clock[i]);
 		if (ret)
 			pixel_clock[i] = 0;
 	}
@@ -1162,9 +1204,14 @@ int vfe_get(struct vfe_device *vfe)
 		vfe_reset_output_maps(vfe);
 
 		vfe_init_outputs(vfe);
+		WRITE_ONCE(vfe->reset_failed, false);
 
 		vfe->res->hw_ops->hw_version(vfe);
 	} else {
+		if (READ_ONCE(vfe->reset_failed)) {
+			ret = -EIO;
+			goto error_pm_domain;
+		}
 		ret = vfe_check_clock_rates(vfe);
 		if (ret < 0)
 			goto error_pm_domain;
@@ -1298,9 +1345,11 @@ static int vfe_set_stream(struct v4l2_subdev *sd, int enable)
 	if (enable) {
 		line->output.state = VFE_OUTPUT_RESERVED;
 		ret = vfe->res->hw_ops->vfe_enable(line);
-		if (ret < 0)
+		if (ret < 0) {
+			line->output.state = VFE_OUTPUT_OFF;
 			dev_err(vfe->camss->dev,
 				"Failed to enable vfe outputs\n");
+		}
 	} else {
 		ret = vfe->res->hw_ops->vfe_disable(line);
 		if (ret < 0)
