@@ -42,6 +42,13 @@ properties:
 
   monitored-battery: true
 
+  qcom,charge-pump:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Optional SMB1390 secondary charge pump power supply.
+
+  dpdm-supply:
+    description: USB high-speed PHY regulator that releases D+/D- for QC.
+
   input-current-limit-microamp:
     description: |
       PM8150B/PM7250B board ceiling for USB input current. This is
@@ -50,31 +57,6 @@ properties:
       briefly suspend USBIN while the software override is programmed
       and checked. After a configuration error, the driver requests
       USBIN suspend and refuses further updates until reprobe.
-    minimum: 50000
-    maximum: 4800000
-    multipleOf: 50000
-
-  qcom,secondary-charger-present:
-    description: |
-      The board has a secondary charger controlled by SMB_EN. Hold SMB_EN
-      inactive during probe until a coordinated charging policy owns it.
-    type: boolean
-
-  qcom,primary-charge-current-limit-microamp:
-    description: |
-      Maximum battery charge current while the secondary charge pump is not
-      under the coordinated policy. The pump policy may request a higher
-      current up to the monitored battery limit only through the internal
-      charger handoff API.
-    minimum: 50000
-    maximum: 5100000
-    multipleOf: 50000
-
-  qcom,primary-input-current-limit-microamp:
-    description: |
-      USB input current ceiling for ordinary charging. A coordinated charge
-      pump policy can request up to input-current-limit-microamp through the
-      internal charger handoff API after validating PPS and the USB input.
     minimum: 50000
     maximum: 4800000
     multipleOf: 50000
@@ -91,13 +73,6 @@ required:
 allOf:
   - $ref: power-supply.yaml#
   - if:
-      required:
-        - qcom,secondary-charger-present
-    then:
-      required:
-        - qcom,primary-charge-current-limit-microamp
-        - qcom,primary-input-current-limit-microamp
-  - if:
       properties:
         compatible:
           contains:
@@ -106,9 +81,6 @@ allOf:
       properties:
         input-current-limit-microamp:
           maximum: 3000000
-        qcom,secondary-charger-present: false
-        qcom,primary-charge-current-limit-microamp: false
-        qcom,primary-input-current-limit-microamp: false
   - if:
       properties:
         compatible:
@@ -119,9 +91,6 @@ allOf:
     then:
       properties:
         input-current-limit-microamp: false
-        qcom,secondary-charger-present: false
-        qcom,primary-charge-current-limit-microamp: false
-        qcom,primary-input-current-limit-microamp: false
 
 additionalProperties: false
 

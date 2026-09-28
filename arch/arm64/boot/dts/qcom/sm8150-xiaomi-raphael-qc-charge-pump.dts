@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* Opt-in Raphael SMB1390 QC charge pump evaluation. */
+#include "sm8150-xiaomi-raphael.dts"
+
+/ {
+	model = "Xiaomi Redmi K20 Pro (QC charge pump evaluation)";
+};
+
+&pm8150b_charger {
+	input-current-limit-microamp = <2800000>;
+	qcom,charge-pump = <&smb1390>;
+	dpdm-supply = <&raphael_dpdm>;
+};
+
+&usb_1_hsphy {
+	raphael_dpdm: qcom,dpdm-regulator {
+		regulator-name = "dpdm";
+	};
+};
+
+&i2c4 {
+	status = "okay";
+};
+
+&smb1390 {
+	status = "okay";
+};

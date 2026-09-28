@@ -62,6 +62,12 @@ properties:
   vdda33-supply:
     description: phandle to the regulator 3.3V supply node.
 
+  qcom,dpdm-regulator:
+    $ref: /schemas/regulator/regulator.yaml#
+    description: Optional D+/D- handoff regulator for QC charge pump evaluation.
+    type: object
+    unevaluatedProperties: false
+
   qcom,hs-disconnect-bp:
     description:
       This adjusts the voltage level for the threshold used to
