@@ -594,7 +594,6 @@ static const struct file_operations drv8846_fops = {
 #endif
 	.poll = drv8846_poll,
 	.fasync = drv8846_fasync,
-	.llseek = no_llseek,
 };
 
 static int drv8846_read_config(struct device *dev, struct drv8846 *motor)
@@ -663,8 +662,8 @@ static int drv8846_probe(struct platform_device *pdev)
 	atomic_set(&motor->move_done, 0);
 	INIT_DELAYED_WORK(&motor->phase_work, drv8846_phase_work);
 	INIT_WORK(&motor->stop_work, drv8846_stop_work);
-	hrtimer_init(&motor->watchdog, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	motor->watchdog.function = drv8846_watchdog;
+	hrtimer_setup(&motor->watchdog, drv8846_watchdog,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 
 	ret = drv8846_read_config(dev, motor);
 	if (ret)

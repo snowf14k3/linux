@@ -24,6 +24,7 @@
 #include <media/v4l2-cci.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-fwnode.h>
+#include <media/v4l2-event.h>
 #include <media/v4l2-subdev.h>
 
 #include "raphael-sensor.h"
@@ -262,7 +263,6 @@ release_group:
 			ret = release_ret;
 	}
 
-put_pm:
 	pm_runtime_put(sensor->dev);
 	return ret;
 }

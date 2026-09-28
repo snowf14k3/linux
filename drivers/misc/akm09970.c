@@ -380,7 +380,6 @@ static const struct file_operations akm09970_fops = {
 	.compat_ioctl = akm09970_compat_ioctl,
 #endif
 	.poll = akm09970_poll,
-	.llseek = no_llseek,
 };
 
 static int akm09970_probe(struct i2c_client *client)
