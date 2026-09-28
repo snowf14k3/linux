@@ -11,6 +11,7 @@
 #include <linux/irqchip.h>
 #include <linux/irqdesc.h>
 #include <linux/irqchip/chained_irq.h>
+#include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -21,6 +22,11 @@
 #include "msm_kms.h"
 
 #include <generated/mdss.xml.h>
+
+#if IS_REACHABLE(CONFIG_SM_DISPCC_8250)
+int disp_cc_sm8250_boot_display_handoff(void);
+void disp_cc_sm8250_boot_display_complete(void);
+#endif
 
 #define MIN_IB_BW	400000000UL /* Min ib vote 400MB */
 
@@ -251,6 +257,10 @@ static int msm_mdss_enable(struct msm_mdss *msm_mdss)
 {
 	int ret, i;
 
+#if IS_REACHABLE(CONFIG_SM_DISPCC_8250)
+	disp_cc_sm8250_boot_display_handoff();
+#endif
+
 	/*
 	 * Several components have AXI clocks that can only be turned on if
 	 * the interconnect is enabled (non-zero bandwidth). Let's make sure
@@ -275,6 +285,11 @@ static int msm_mdss_enable(struct msm_mdss *msm_mdss)
 		dev_err(msm_mdss->dev, "clock enable failed, ret:%d\n", ret);
 		return ret;
 	}
+
+#if IS_REACHABLE(CONFIG_SM_DISPCC_8250)
+	/* DRM now holds its own bus and clock votes. */
+	disp_cc_sm8250_boot_display_complete();
+#endif
 
 	/*
 	 * Register access requires MDSS_MDP_CLK, which is not enabled by the
@@ -352,6 +367,32 @@ static void msm_mdss_destroy(struct msm_mdss *msm_mdss)
 	irq_set_chained_handler_and_data(irq, NULL, NULL);
 }
 
+static bool mdss_boot_display_on(struct device *dev)
+{
+	static const char * const compatibles[] = {
+		"qcom,sm8150-dispcc", "qcom,sm8250-dispcc",
+		"qcom,sc8180x-dispcc", "qcom,sm8350-dispcc",
+	};
+	struct device_node *np;
+	int i;
+
+	if (of_property_read_bool(dev->of_node, "qcom,boot-display-on"))
+		return true;
+
+	for (i = 0; i < ARRAY_SIZE(compatibles); i++) {
+		np = of_find_compatible_node(NULL, NULL, compatibles[i]);
+		if (!np)
+			continue;
+		if (of_property_read_bool(np, "qcom,boot-display-on")) {
+			of_node_put(np);
+			return true;
+		}
+		of_node_put(np);
+	}
+
+	return false;
+}
+
 static int msm_mdss_reset(struct device *dev)
 {
 	struct reset_control *reset;
@@ -415,9 +456,14 @@ static struct msm_mdss *msm_mdss_init(struct platform_device *pdev, bool is_mdp5
 	int ret;
 	int irq;
 
-	ret = msm_mdss_reset(&pdev->dev);
-	if (ret)
-		return ERR_PTR(ret);
+	if (mdss_boot_display_on(&pdev->dev)) {
+		dev_info(&pdev->dev,
+			 "preserving bootloader MDP state (qcom,boot-display-on)\n");
+	} else {
+		ret = msm_mdss_reset(&pdev->dev);
+		if (ret)
+			return ERR_PTR(ret);
+	}
 
 	msm_mdss = devm_kzalloc(&pdev->dev, sizeof(*msm_mdss), GFP_KERNEL);
 	if (!msm_mdss)

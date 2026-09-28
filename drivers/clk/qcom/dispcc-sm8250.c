@@ -3,9 +3,13 @@
  * Copyright (c) 2018-2020, 2022, The Linux Foundation. All rights reserved.
  */
 
+#include <linux/clk.h>
 #include <linux/clk-provider.h>
+#include <linux/interconnect.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
@@ -1252,6 +1256,165 @@ static const struct of_device_id disp_cc_sm8250_match_table[] = {
 };
 MODULE_DEVICE_TABLE(of, disp_cc_sm8250_match_table);
 
+static struct regmap *disp_cc_boot_regmap;
+static struct device *disp_cc_boot_dev;
+static bool disp_cc_boot_hw_deferred;
+
+#define BOOT_SPLASH_MIN_BW 400000000UL
+
+static struct icc_path *boot_mdss_paths[2];
+static struct clk *boot_mdss_clks[2];
+static int boot_mdss_clk_count;
+
+/* Keep firmware's active MDP RCGs on their current parents until handoff. */
+static void disp_cc_sm8250_skip_shared_rcg_park(void)
+{
+	static struct clk_rcg2 * const shared_rcgs[] = {
+		&disp_cc_mdss_ahb_clk_src,
+		&disp_cc_mdss_mdp_clk_src,
+		&disp_cc_mdss_rot_clk_src,
+	};
+	static struct clk_init_data splash_init[ARRAY_SIZE(shared_rcgs)];
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(shared_rcgs); i++) {
+		splash_init[i] = *shared_rcgs[i]->clkr.hw.init;
+		splash_init[i].ops = &clk_rcg2_shared_no_init_park_ops;
+		shared_rcgs[i]->clkr.hw.init = &splash_init[i];
+	}
+}
+
+static void disp_cc_sm8250_release_boot_resources(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(boot_mdss_paths); i++) {
+		if (!boot_mdss_paths[i])
+			continue;
+		icc_set_bw(boot_mdss_paths[i], 0, 0);
+		icc_put(boot_mdss_paths[i]);
+		boot_mdss_paths[i] = NULL;
+	}
+	for (i = 0; i < boot_mdss_clk_count; i++) {
+		clk_disable_unprepare(boot_mdss_clks[i]);
+		clk_put(boot_mdss_clks[i]);
+		boot_mdss_clks[i] = NULL;
+	}
+	boot_mdss_clk_count = 0;
+}
+
+/* MDSS owns the interconnect specifiers; DISPCC holds temporary votes. */
+static int disp_cc_sm8250_boot_display_preserve_bus(struct device *dev)
+{
+	static const char * const icc_names[] = { "mdp0-mem", "mdp1-mem" };
+	static const char * const clk_names[] = { "bus", "nrt_bus" };
+	struct platform_device *mdss_pdev;
+	struct device_node *mdss_np;
+	struct icc_path *path;
+	struct clk *clk;
+	int i, ret;
+
+	mdss_np = of_find_compatible_node(NULL, NULL, "qcom,sm8150-mdss");
+	if (!mdss_np)
+		mdss_np = of_find_compatible_node(NULL, NULL, "qcom,sm8250-mdss");
+	if (!mdss_np)
+		mdss_np = of_find_compatible_node(NULL, NULL, "qcom,sc8180x-mdss");
+	if (!mdss_np)
+		return -ENODEV;
+
+	mdss_pdev = of_find_device_by_node(mdss_np);
+	if (!mdss_pdev) {
+		of_node_put(mdss_np);
+		return -EPROBE_DEFER;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(icc_names); i++) {
+		path = of_icc_get(&mdss_pdev->dev, icc_names[i]);
+		if (IS_ERR_OR_NULL(path)) {
+			ret = PTR_ERR_OR_ZERO(path);
+			if (!ret)
+				ret = -ENODEV;
+			goto release;
+		}
+		boot_mdss_paths[i] = path;
+		ret = icc_set_bw(path, 0, Bps_to_icc(BOOT_SPLASH_MIN_BW));
+		if (ret)
+			goto release;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(clk_names); i++) {
+		clk = of_clk_get_by_name(mdss_np, clk_names[i]);
+		if (IS_ERR(clk)) {
+			ret = PTR_ERR(clk);
+			goto release;
+		}
+		ret = clk_prepare_enable(clk);
+		if (ret) {
+			clk_put(clk);
+			goto release;
+		}
+		boot_mdss_clks[boot_mdss_clk_count++] = clk;
+	}
+
+	put_device(&mdss_pdev->dev);
+	of_node_put(mdss_np);
+	return 0;
+
+release:
+	put_device(&mdss_pdev->dev);
+	of_node_put(mdss_np);
+	disp_cc_sm8250_release_boot_resources();
+	return dev_err_probe(dev, ret, "failed to preserve MDSS bus or clocks\n");
+}
+
+static void disp_cc_sm8250_program_hw(struct device *dev, struct regmap *regmap,
+				      bool enable_mdp_cg)
+{
+	if (of_device_is_compatible(dev->of_node, "qcom,sm8350-dispcc")) {
+		clk_lucid_5lpe_pll_configure(&disp_cc_pll0, regmap, &disp_cc_pll0_config);
+		clk_lucid_5lpe_pll_configure(&disp_cc_pll1, regmap, &disp_cc_pll1_config);
+	} else {
+		clk_lucid_pll_configure(&disp_cc_pll0, regmap, &disp_cc_pll0_config);
+		clk_lucid_pll_configure(&disp_cc_pll1, regmap, &disp_cc_pll1_config);
+	}
+
+	if (enable_mdp_cg)
+		regmap_update_bits(regmap, 0x8000, 0x10, 0x10);
+
+	/* DISP_CC_XO_CLK */
+	qcom_branch_set_clk_en(regmap, 0x605c);
+}
+
+/*
+ * Finish dispcc hardware programming deferred for continuous splash.
+ * Called when MDSS is ready to take over the display path.
+ */
+int disp_cc_sm8250_boot_display_handoff(void);
+int disp_cc_sm8250_boot_display_handoff(void)
+{
+	if (!disp_cc_boot_hw_deferred || !disp_cc_boot_regmap || !disp_cc_boot_dev)
+		return 0;
+
+	disp_cc_sm8250_program_hw(disp_cc_boot_dev, disp_cc_boot_regmap, false);
+	disp_cc_boot_hw_deferred = false;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(disp_cc_sm8250_boot_display_handoff);
+
+void disp_cc_sm8250_boot_display_complete(void);
+void disp_cc_sm8250_boot_display_complete(void)
+{
+	if (!disp_cc_boot_dev || disp_cc_boot_hw_deferred)
+		return;
+
+	disp_cc_sm8250_release_boot_resources();
+	pm_runtime_put(disp_cc_boot_dev);
+	dev_info(disp_cc_boot_dev, "boot display handoff complete\n");
+	disp_cc_boot_regmap = NULL;
+	disp_cc_boot_dev = NULL;
+}
+EXPORT_SYMBOL_GPL(disp_cc_sm8250_boot_display_complete);
+
 static int disp_cc_sm8250_probe(struct platform_device *pdev)
 {
 	struct regmap *regmap;
@@ -1360,23 +1523,36 @@ static int disp_cc_sm8250_probe(struct platform_device *pdev)
 		disp_cc_sm8250_clocks[DISP_CC_MDSS_EDP_GTC_CLK_SRC] = NULL;
 	}
 
-	if (of_device_is_compatible(pdev->dev.of_node, "qcom,sm8350-dispcc")) {
-		clk_lucid_5lpe_pll_configure(&disp_cc_pll0, regmap, &disp_cc_pll0_config);
-		clk_lucid_5lpe_pll_configure(&disp_cc_pll1, regmap, &disp_cc_pll1_config);
+	if (of_property_read_bool(pdev->dev.of_node, "qcom,boot-display-on")) {
+		ret = disp_cc_sm8250_boot_display_preserve_bus(&pdev->dev);
+		if (ret) {
+			pm_runtime_put(&pdev->dev);
+			return ret;
+		}
+
+		disp_cc_sm8250_skip_shared_rcg_park();
+		disp_cc_boot_regmap = regmap;
+		disp_cc_boot_dev = &pdev->dev;
+		disp_cc_boot_hw_deferred = true;
+		dev_info(&pdev->dev,
+			 "deferring dispcc PLL/CG init for bootloader splash\n");
 	} else {
-		clk_lucid_pll_configure(&disp_cc_pll0, regmap, &disp_cc_pll0_config);
-		clk_lucid_pll_configure(&disp_cc_pll1, regmap, &disp_cc_pll1_config);
+		disp_cc_sm8250_program_hw(&pdev->dev, regmap, true);
 	}
 
-	/* Enable clock gating for MDP clocks */
-	regmap_update_bits(regmap, 0x8000, 0x10, 0x10);
-
-	/* Keep some clocks always-on */
-	qcom_branch_set_clk_en(regmap, 0x605c); /* DISP_CC_XO_CLK */
-
 	ret = qcom_cc_really_probe(&pdev->dev, &disp_cc_sm8250_desc, regmap);
-
-	pm_runtime_put(&pdev->dev);
+	if (disp_cc_boot_hw_deferred && !ret) {
+		dev_info(&pdev->dev,
+			 "holding MMCX vote for bootloader splash\n");
+	} else {
+		if (disp_cc_boot_hw_deferred) {
+			disp_cc_sm8250_release_boot_resources();
+			disp_cc_boot_hw_deferred = false;
+			disp_cc_boot_regmap = NULL;
+			disp_cc_boot_dev = NULL;
+		}
+		pm_runtime_put(&pdev->dev);
+	}
 
 	return ret;
 }
