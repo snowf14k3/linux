@@ -79,16 +79,6 @@
 		stdout-path = "serial0:115200n8";
 		bootargs = "earlycon console=ttyMSM0,115200";
 
-		framebuffer: framebuffer@9c000000 {
-			compatible = "simple-framebuffer";
-			reg = <0 0x9c000000 0 (1080 * 2340 * 4)>;
-			width = <1080>;
-			height = <2340>;
-			stride = <(1080 * 4)>;
-			format = "a8r8g8b8";
-			display = <&panel>;
-			clocks = <&gcc GCC_DISP_HF_AXI_CLK>;
-		};
 	};
 
         gpio-keys {
@@ -649,6 +639,7 @@
 
 &mdss {
 	status = "okay";
+	qcom,boot-display-on;
 };
 
 &pm8150_gpios {
@@ -1336,4 +1327,16 @@
 	mac-address = [02 00 78 e0 04 ef];
 
 	status = "okay";
+};
+/*
+ * Preserve the display state left by XBL/U-Boot until DRM_MSM takes over.
+ * The corresponding dispcc/mdss driver changes defer destructive clock/GDSC
+ * programming and keep the MDP data path powered during the handoff.
+ */
+&dispcc {
+	qcom,boot-display-on;
+	required-opps = <&rpmhpd_opp_nom>;
+	interconnects = <&mmss_noc MASTER_MDP_PORT0 0 &mc_virt SLAVE_EBI_CH0 0>,
+			<&mmss_noc MASTER_MDP_PORT1 0 &mc_virt SLAVE_EBI_CH0 0>;
+	interconnect-names = "mdp0-mem", "mdp1-mem";
 };
