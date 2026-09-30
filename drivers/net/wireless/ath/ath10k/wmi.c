@@ -8,6 +8,7 @@
 
 #include <linux/skbuff.h>
 #include <linux/ctype.h>
+#include <linux/ktime.h>
 
 #include "core.h"
 #include "htc.h"
@@ -25,6 +26,10 @@
 #define ATH10K_WMI_BARRIER_ECHO_ID 0xBA991E9
 #define ATH10K_WMI_BARRIER_TIMEOUT_HZ (3 * HZ)
 #define ATH10K_WMI_DFS_CONF_TIMEOUT_HZ (HZ / 6)
+
+#define ATH10K_WMI_SCAN_RX_QUEUE_LIMIT 512
+#define ATH10K_WMI_SCAN_RX_BATCH 32
+#define ATH10K_WMI_SCAN_RX_SLICE_NS (2 * NSEC_PER_MSEC)
 
 /* MAIN WMI cmd track */
 static struct wmi_cmd_map wmi_cmd_map = {
@@ -2639,8 +2644,14 @@ int ath10k_wmi_event_mgmt_rx(struct ath10k *ar, struct sk_buff *skb)
 		ath10k_mac_handle_beacon(ar, skb);
 
 	if (ieee80211_is_beacon(hdr->frame_control) ||
-	    ieee80211_is_probe_resp(hdr->frame_control))
-		status->boottime_ns = ktime_get_boottime_ns();
+	    ieee80211_is_probe_resp(hdr->frame_control)) {
+		if (ar->wmi.scan_rx_wq && skb->tstamp) {
+			status->boottime_ns = ktime_to_ns(skb->tstamp);
+			skb->tstamp = 0;
+		} else {
+			status->boottime_ns = ktime_get_boottime_ns();
+		}
+	}
 
 	ath10k_dbg(ar, ATH10K_DBG_MGMT,
 		   "event mgmt rx skb %p len %d ftype %02x stype %02x\n",
@@ -6419,13 +6430,123 @@ out:
 	dev_kfree_skb(skb);
 }
 
-static void ath10k_wmi_process_rx(struct ath10k *ar, struct sk_buff *skb)
+static void ath10k_wmi_process_rx_now(struct ath10k *ar, struct sk_buff *skb)
 {
 	int ret;
 
 	ret = ath10k_wmi_rx(ar, skb);
 	if (ret)
 		ath10k_warn(ar, "failed to process wmi rx: %d\n", ret);
+}
+
+static void ath10k_wmi_scan_rx_work(struct work_struct *work)
+{
+	struct ath10k_wmi *wmi =
+		container_of(to_delayed_work(work), struct ath10k_wmi,
+			     scan_rx_work);
+	struct ath10k *ar = container_of(wmi, struct ath10k, wmi);
+	u64 deadline = ktime_get_ns() + ATH10K_WMI_SCAN_RX_SLICE_NS;
+	struct sk_buff *skb;
+	unsigned int count = 0;
+
+	while (count < ATH10K_WMI_SCAN_RX_BATCH) {
+		spin_lock_bh(&wmi->scan_rx_queue.lock);
+		skb = wmi->scan_rx_enabled ?
+			__skb_dequeue(&wmi->scan_rx_queue) : NULL;
+		spin_unlock_bh(&wmi->scan_rx_queue.lock);
+		if (!skb)
+			break;
+
+		if (test_bit(ATH10K_FLAG_CRASH_FLUSH, &ar->dev_flags))
+			dev_kfree_skb_any(skb);
+		else
+			ath10k_wmi_process_rx_now(ar, skb);
+
+		count++;
+		cond_resched();
+		if (ktime_get_ns() >= deadline)
+			break;
+	}
+
+	spin_lock_bh(&wmi->scan_rx_queue.lock);
+	if (wmi->scan_rx_enabled && !skb_queue_empty(&wmi->scan_rx_queue))
+		queue_delayed_work(wmi->scan_rx_wq, &wmi->scan_rx_work, 1);
+	else
+		wmi->scan_rx_scheduled = false;
+	spin_unlock_bh(&wmi->scan_rx_queue.lock);
+}
+
+static void
+ath10k_wmi_queue_scan_rx(struct ath10k *ar, struct sk_buff *skb,
+			 enum ath10k_wmi_tlv_scan_rx_type type)
+{
+	struct ath10k_wmi *wmi = &ar->wmi;
+	bool full = false;
+
+	/* Keep the receive time when BSS parsing runs in the worker. */
+	if (type == ATH10K_WMI_TLV_SCAN_RX_MGMT)
+		skb->tstamp = ktime_get_boottime();
+
+	spin_lock_bh(&wmi->scan_rx_queue.lock);
+	if (!wmi->scan_rx_enabled)
+		goto drop;
+
+	/*
+	 * Scan notifications must remain behind earlier scan results. Only
+	 * disposable beacons/probe responses may be dropped on overflow.
+	 */
+	if (type == ATH10K_WMI_TLV_SCAN_RX_MGMT &&
+	    wmi->scan_rx_queue.qlen >= ATH10K_WMI_SCAN_RX_QUEUE_LIMIT) {
+		full = true;
+		goto drop;
+	}
+
+	__skb_queue_tail(&wmi->scan_rx_queue, skb);
+	if (!wmi->scan_rx_scheduled) {
+		wmi->scan_rx_scheduled = true;
+		queue_delayed_work(wmi->scan_rx_wq, &wmi->scan_rx_work, 0);
+	}
+	spin_unlock_bh(&wmi->scan_rx_queue.lock);
+	return;
+
+drop:
+	spin_unlock_bh(&wmi->scan_rx_queue.lock);
+	if (full)
+		ath10k_warn(ar, "scan RX queue full, dropping management frame\n");
+	dev_kfree_skb_any(skb);
+}
+
+void ath10k_wmi_stop_scan_rx(struct ath10k *ar)
+{
+	struct ath10k_wmi *wmi = &ar->wmi;
+
+	if (!wmi->scan_rx_wq)
+		return;
+
+	spin_lock_bh(&wmi->scan_rx_queue.lock);
+	wmi->scan_rx_enabled = false;
+	spin_unlock_bh(&wmi->scan_rx_queue.lock);
+
+	cancel_delayed_work_sync(&wmi->scan_rx_work);
+	skb_queue_purge(&wmi->scan_rx_queue);
+	spin_lock_bh(&wmi->scan_rx_queue.lock);
+	wmi->scan_rx_scheduled = false;
+	spin_unlock_bh(&wmi->scan_rx_queue.lock);
+}
+
+static void ath10k_wmi_process_rx(struct ath10k *ar, struct sk_buff *skb)
+{
+	enum ath10k_wmi_tlv_scan_rx_type type;
+
+	if (ar->wmi.scan_rx_wq) {
+		type = ath10k_wmi_tlv_classify_scan_rx(ar, skb);
+		if (type != ATH10K_WMI_TLV_SCAN_RX_NONE) {
+			ath10k_wmi_queue_scan_rx(ar, skb, type);
+			return;
+		}
+	}
+
+	ath10k_wmi_process_rx_now(ar, skb);
 }
 
 int ath10k_wmi_connect(struct ath10k *ar)
@@ -9601,6 +9722,18 @@ int ath10k_wmi_attach(struct ath10k *ar)
 	INIT_WORK(&ar->radar_confirmation_work,
 		  ath10k_radar_confirmation_work);
 
+	if (ar->hif.bus == ATH10K_BUS_SNOC &&
+	    ar->running_fw->fw_file.wmi_op_version == ATH10K_FW_WMI_OP_VERSION_TLV) {
+		skb_queue_head_init(&ar->wmi.scan_rx_queue);
+		INIT_DELAYED_WORK(&ar->wmi.scan_rx_work, ath10k_wmi_scan_rx_work);
+		ar->wmi.scan_rx_wq =
+			alloc_ordered_workqueue("ath10k_scan_rx", WQ_MEM_RECLAIM);
+		if (!ar->wmi.scan_rx_wq)
+			return -ENOMEM;
+		ar->wmi.scan_rx_enabled = true;
+		ar->wmi.scan_rx_scheduled = false;
+	}
+
 	if (test_bit(ATH10K_FW_FEATURE_MGMT_TX_BY_REF,
 		     ar->running_fw->fw_file.fw_features)) {
 		idr_init(&ar->wmi.mgmt_pending_tx);
@@ -9645,6 +9778,12 @@ static int ath10k_wmi_mgmt_tx_clean_up_pending(int msdu_id, void *ptr,
 
 void ath10k_wmi_detach(struct ath10k *ar)
 {
+	ath10k_wmi_stop_scan_rx(ar);
+	if (ar->wmi.scan_rx_wq) {
+		destroy_workqueue(ar->wmi.scan_rx_wq);
+		ar->wmi.scan_rx_wq = NULL;
+	}
+
 	if (test_bit(ATH10K_FW_FEATURE_MGMT_TX_BY_REF,
 		     ar->running_fw->fw_file.fw_features)) {
 		spin_lock_bh(&ar->data_lock);

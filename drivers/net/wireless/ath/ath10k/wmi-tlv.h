@@ -2416,6 +2416,14 @@ struct wmi_tlv_rfkill_state_change_ev {
 	__le32 radio_state;
 };
 
+enum ath10k_wmi_tlv_scan_rx_type {
+	ATH10K_WMI_TLV_SCAN_RX_NONE,
+	ATH10K_WMI_TLV_SCAN_RX_EVENT,
+	ATH10K_WMI_TLV_SCAN_RX_MGMT,
+};
+
+enum ath10k_wmi_tlv_scan_rx_type
+ath10k_wmi_tlv_classify_scan_rx(struct ath10k *ar, const struct sk_buff *skb);
 void ath10k_wmi_tlv_attach(struct ath10k *ar);
 
 enum wmi_nlo_auth_algorithm {

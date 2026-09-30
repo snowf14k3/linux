@@ -16,6 +16,7 @@
 #include "testmode.h"
 #include "txrx.h"
 #include <linux/bitfield.h>
+#include <linux/unaligned.h>
 
 /***************/
 /* TLV helpers */
@@ -130,6 +131,71 @@ static int ath10k_wmi_tlv_iter_parse(struct ath10k *ar, u16 tag, u16 len,
 		tb[tag] = ptr;
 
 	return 0;
+}
+
+struct ath10k_wmi_tlv_scan_rx_arg {
+	const struct wmi_tlv_mgmt_rx_ev *ev;
+	const u8 *frame;
+	size_t frame_len;
+};
+
+static int ath10k_wmi_tlv_iter_scan_rx(struct ath10k *ar, u16 tag, u16 len,
+				       const void *ptr, void *data)
+{
+	struct ath10k_wmi_tlv_scan_rx_arg *arg = data;
+
+	switch (tag) {
+	case WMI_TLV_TAG_STRUCT_MGMT_RX_HDR:
+		arg->ev = ptr;
+		break;
+	case WMI_TLV_TAG_ARRAY_BYTE:
+		arg->frame = ptr;
+		arg->frame_len = len;
+		break;
+	}
+
+	return 0;
+}
+
+enum ath10k_wmi_tlv_scan_rx_type
+ath10k_wmi_tlv_classify_scan_rx(struct ath10k *ar, const struct sk_buff *skb)
+{
+	struct ath10k_wmi_tlv_scan_rx_arg arg = {};
+	const struct wmi_cmd_hdr *hdr;
+	u32 id, frame_len;
+	__le16 fc;
+	int ret;
+
+	if (skb->len < sizeof(*hdr))
+		return ATH10K_WMI_TLV_SCAN_RX_NONE;
+
+	hdr = (const void *)skb->data;
+	id = MS(__le32_to_cpu(hdr->cmd_id), WMI_CMD_HDR_CMD_ID);
+	switch (id) {
+	case WMI_TLV_SCAN_EVENTID:
+	case WMI_TLV_CHAN_INFO_EVENTID:
+		return ATH10K_WMI_TLV_SCAN_RX_EVENT;
+	case WMI_TLV_MGMT_RX_EVENTID:
+		break;
+	default:
+		return ATH10K_WMI_TLV_SCAN_RX_NONE;
+	}
+
+	ret = ath10k_wmi_tlv_iter(ar, skb->data + sizeof(*hdr),
+				  skb->len - sizeof(*hdr),
+				  ath10k_wmi_tlv_iter_scan_rx, &arg);
+	if (ret || !arg.ev || !arg.frame)
+		return ATH10K_WMI_TLV_SCAN_RX_NONE;
+
+	frame_len = __le32_to_cpu(arg.ev->buf_len);
+	if (frame_len < sizeof(fc) || frame_len > arg.frame_len)
+		return ATH10K_WMI_TLV_SCAN_RX_NONE;
+
+	fc = get_unaligned((const __le16 *)arg.frame);
+	if (ieee80211_is_beacon(fc) || ieee80211_is_probe_resp(fc))
+		return ATH10K_WMI_TLV_SCAN_RX_MGMT;
+
+	return ATH10K_WMI_TLV_SCAN_RX_NONE;
 }
 
 static int ath10k_wmi_tlv_parse(struct ath10k *ar, const void **tb,

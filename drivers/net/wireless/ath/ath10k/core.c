@@ -3292,6 +3292,7 @@ int ath10k_core_start(struct ath10k *ar, enum ath10k_firmware_mode mode,
 
 err_hif_stop:
 	ath10k_hif_stop(ar);
+	ath10k_wmi_stop_scan_rx(ar);
 err_htt_rx_detach:
 	ath10k_htt_rx_free(&ar->htt);
 err_htt_tx_detach:
@@ -3337,6 +3338,7 @@ void ath10k_core_stop(struct ath10k *ar)
 		ath10k_wait_for_suspend(ar, WMI_PDEV_SUSPEND_AND_DISABLE_INTR);
 
 	ath10k_hif_stop(ar);
+	ath10k_wmi_stop_scan_rx(ar);
 	ath10k_htt_tx_stop(&ar->htt);
 	ath10k_htt_rx_free(&ar->htt);
 	ath10k_wmi_detach(ar);

@@ -206,6 +206,13 @@ struct ath10k_wmi {
 
 	u32 mgmt_max_num_pending_tx;
 
+	struct workqueue_struct *scan_rx_wq;
+	struct delayed_work scan_rx_work;
+	struct sk_buff_head scan_rx_queue;
+	/* Protected by scan_rx_queue.lock. */
+	bool scan_rx_enabled;
+	bool scan_rx_scheduled;
+
 	/* Protected by data_lock */
 	struct idr mgmt_pending_tx;
 
