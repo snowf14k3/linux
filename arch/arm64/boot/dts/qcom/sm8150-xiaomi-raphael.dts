@@ -423,8 +423,9 @@
 		};
 
 		vreg_l17a_3p0: ldo17 {
-			regulator-min-microvolt = <2856000>;
-			regulator-max-microvolt = <3008000>;
+			/* CamX requests 3.1 V; PM8150 PLDO uses 8 mV steps. */
+			regulator-min-microvolt = <3104000>;
+			regulator-max-microvolt = <3104000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 

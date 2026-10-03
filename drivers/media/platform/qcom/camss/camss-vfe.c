@@ -895,12 +895,26 @@ int vfe_disable(struct vfe_line *line)
 	int ret;
 
 	mutex_lock(&vfe->stream_lock);
+	if (READ_ONCE(vfe->dma_quarantined)) {
+		ret = -EIO;
+		goto unlock;
+	}
 	ret = vfe_disable_output(line);
-	/* WMs are off; reject reuse until a later power-on reset succeeds. */
-	if (ret)
+	if (ret) {
 		WRITE_ONCE(vfe->reset_failed, true);
+		if (vfe->camss->res->version == CAMSS_8150) {
+			/*
+			 * WM_CFG=0 is not a DMA drain acknowledgment. Keep the
+			 * output ownership, queue, clocks and power until reboot.
+			 */
+			WRITE_ONCE(vfe->dma_quarantined, true);
+			camss_video_quarantine(&line->video_out);
+			goto unlock;
+		}
+	}
 	vfe_put_output(line);
 	vfe->stream_count--;
+unlock:
 	mutex_unlock(&vfe->stream_lock);
 
 	return ret;
@@ -1178,6 +1192,10 @@ int vfe_get(struct vfe_device *vfe)
 	int ret;
 
 	mutex_lock(&vfe->power_lock);
+	if (READ_ONCE(vfe->dma_quarantined)) {
+		ret = -EIO;
+		goto error_pm_domain;
+	}
 
 	if (vfe->power_count == 0) {
 		ret = vfe->res->hw_ops->pm_domain_on(vfe);
@@ -1244,6 +1262,10 @@ void vfe_put(struct vfe_device *vfe)
 {
 	mutex_lock(&vfe->power_lock);
 
+	/* DMA mappings and their power context must remain valid after failure. */
+	if (READ_ONCE(vfe->dma_quarantined))
+		goto exit;
+
 	if (vfe->power_count == 0) {
 		dev_err(vfe->camss->dev, "vfe power off on power_count == 0\n");
 		goto exit;
@@ -1283,15 +1305,22 @@ int vfe_flush_buffers(struct camss_video *vid,
 
 	output = &line->output;
 
+	if (READ_ONCE(vid->dma_quarantined))
+		return -EIO;
+
 	spin_lock_irqsave(&vfe->output_lock, flags);
 
 	vfe_buf_flush_pending(output, state);
 
-	if (output->buf[0])
+	if (output->buf[0]) {
 		vb2_buffer_done(&output->buf[0]->vb.vb2_buf, state);
+		output->buf[0] = NULL;
+	}
 
-	if (output->buf[1])
+	if (output->buf[1]) {
 		vb2_buffer_done(&output->buf[1]->vb.vb2_buf, state);
+		output->buf[1] = NULL;
+	}
 
 	if (output->last_buffer) {
 		vb2_buffer_done(&output->last_buffer->vb.vb2_buf, state);
@@ -1341,6 +1370,9 @@ static int vfe_set_stream(struct v4l2_subdev *sd, int enable)
 	struct vfe_line *line = v4l2_get_subdevdata(sd);
 	struct vfe_device *vfe = to_vfe(line);
 	int ret;
+
+	if (READ_ONCE(vfe->dma_quarantined))
+		return -EIO;
 
 	if (enable) {
 		line->output.state = VFE_OUTPUT_RESERVED;
@@ -1453,6 +1485,11 @@ static void vfe_try_format(struct vfe_line *line,
 
 		fmt->width = clamp_t(u32, fmt->width, 1, 8191);
 		fmt->height = clamp_t(u32, fmt->height, 1, 8191);
+		if (to_vfe(line)->camss->res->version == CAMSS_8150 &&
+		    vfe_line_is_pix(to_vfe(line), line->id)) {
+			fmt->width = max_t(u32, fmt->width, 16) & ~1U;
+			fmt->height = max_t(u32, fmt->height, 4) & ~1U;
+		}
 
 		fmt->field = V4L2_FIELD_NONE;
 		fmt->colorspace = V4L2_COLORSPACE_SRGB;
@@ -1481,6 +1518,16 @@ static void vfe_try_format(struct vfe_line *line,
 	}
 
 	fmt->colorspace = V4L2_COLORSPACE_SRGB;
+	if (to_vfe(line)->camss->res->version == CAMSS_8150 &&
+	    vfe_line_is_pix(to_vfe(line), line->id) && pad == MSM_VFE_PAD_SRC) {
+		/*
+		 * Nominal primaries only: this fixed frontend has no per-sensor
+		 * color calibration. CST is full-range BT.601, without gamma.
+		 */
+		fmt->xfer_func = V4L2_XFER_FUNC_NONE;
+		fmt->ycbcr_enc = V4L2_YCBCR_ENC_601;
+		fmt->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	}
 }
 
 /*
@@ -1498,6 +1545,21 @@ static void vfe_try_compose(struct vfe_line *line,
 	struct v4l2_mbus_framefmt *fmt;
 
 	fmt = __vfe_get_format(line, sd_state, MSM_VFE_PAD_SINK, which);
+	if (to_vfe(line)->camss->res->version == CAMSS_8150) {
+		u32 min_width = max_t(u32, 16,
+			ALIGN(DIV_ROUND_UP(fmt->width, SCALER_RATIO_MAX), 2));
+		u32 min_height = max_t(u32, 4,
+			ALIGN(DIV_ROUND_UP(fmt->height, SCALER_RATIO_MAX), 2));
+
+		/* MNDS has no compose offset; preserve complete chroma pairs. */
+		rect->left = 0;
+		rect->top = 0;
+		rect->width = clamp_t(s32, rect->width, min_width,
+				    fmt->width) & ~1;
+		rect->height = clamp_t(s32, rect->height, min_height,
+				     fmt->height) & ~1;
+		return;
+	}
 
 	if (rect->width > fmt->width)
 		rect->width = fmt->width;
@@ -1537,6 +1599,18 @@ static void vfe_try_crop(struct vfe_line *line,
 	struct v4l2_rect *compose;
 
 	compose = __vfe_get_compose(line, sd_state, which);
+	if (to_vfe(line)->camss->res->version == CAMSS_8150) {
+		/* FULL line mode and 4:2:0 require aligned crop dimensions. */
+		rect->width = clamp_t(s32, rect->width, 16,
+				    compose->width) & ~15;
+		rect->height = clamp_t(s32, rect->height, 4,
+				     min_t(s32, compose->height, 4096)) & ~1;
+		rect->left = clamp_t(s32, rect->left, 0,
+				   compose->width - rect->width) & ~1;
+		rect->top = clamp_t(s32, rect->top, 0,
+				  compose->height - rect->height) & ~1;
+		return;
+	}
 
 	if (rect->width > compose->width)
 		rect->width = compose->width;
@@ -1680,6 +1754,11 @@ static int vfe_set_format(struct v4l2_subdev *sd,
 	struct vfe_line *line = v4l2_get_subdevdata(sd);
 	struct v4l2_mbus_framefmt *format;
 
+	if (to_vfe(line)->camss->res->version == CAMSS_8150 &&
+	    fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE &&
+	    media_entity_is_streaming(&sd->entity))
+		return -EBUSY;
+
 	format = __vfe_get_format(line, sd_state, fmt->pad, fmt->which);
 	if (format == NULL)
 		return -EINVAL;
@@ -1801,6 +1880,11 @@ static int vfe_set_selection(struct v4l2_subdev *sd,
 	struct vfe_line *line = v4l2_get_subdevdata(sd);
 	struct v4l2_rect *rect;
 	int ret;
+
+	if (to_vfe(line)->camss->res->version == CAMSS_8150 &&
+	    sel->which == V4L2_SUBDEV_FORMAT_ACTIVE &&
+	    media_entity_is_streaming(&sd->entity))
+		return -EBUSY;
 
 	if (!vfe_line_is_pix(to_vfe(line), line->id))
 		return -EINVAL;
@@ -2266,9 +2350,6 @@ void msm_vfe_unregister_entities(struct vfe_device *vfe)
 {
 	int i;
 
-	mutex_destroy(&vfe->power_lock);
-	mutex_destroy(&vfe->stream_lock);
-
 	for (i = 0; i < vfe->res->line_num; i++) {
 		struct v4l2_subdev *sd = &vfe->line[i].subdev;
 		struct camss_video *video_out = &vfe->line[i].video_out;
@@ -2276,6 +2357,11 @@ void msm_vfe_unregister_entities(struct vfe_device *vfe)
 		msm_video_unregister(video_out);
 		v4l2_device_unregister_subdev(sd);
 		media_entity_cleanup(&sd->entity);
+	}
+
+	if (!READ_ONCE(vfe->dma_quarantined)) {
+		mutex_destroy(&vfe->power_lock);
+		mutex_destroy(&vfe->stream_lock);
 	}
 }
 

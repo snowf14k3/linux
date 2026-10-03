@@ -97,31 +97,47 @@ static int subdev_open(struct file *file)
 	struct video_device *vdev = video_devdata(file);
 	struct v4l2_subdev *sd = vdev_to_v4l2_subdev(vdev);
 	struct v4l2_subdev_fh *subdev_fh;
+	struct module *owner = NULL;
+	struct device *dev;
 	int ret;
 
+	if (mutex_lock_interruptible(&sd->devnode_lock))
+		return -ERESTARTSYS;
+	if (!video_is_registered(vdev) || sd->unregistering || !sd->v4l2_dev) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+
+	/* Pin the bridge before init_state or driver open can use its context. */
+	dev = sd->v4l2_dev->mdev ? sd->v4l2_dev->mdev->dev : NULL;
+	if (dev) {
+		if (!dev->driver) {
+			ret = -ENODEV;
+			goto unlock;
+		}
+		owner = dev->driver->owner;
+		if (!try_module_get(owner)) {
+			owner = NULL;
+			ret = -EBUSY;
+			goto unlock;
+		}
+	}
+
 	subdev_fh = kzalloc_obj(*subdev_fh);
-	if (subdev_fh == NULL)
-		return -ENOMEM;
+	if (!subdev_fh) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+	subdev_fh->owner = owner;
 
 	ret = subdev_fh_init(subdev_fh, sd);
 	if (ret) {
 		kfree(subdev_fh);
-		return ret;
+		goto unlock;
 	}
 
 	v4l2_fh_init(&subdev_fh->vfh, vdev);
 	v4l2_fh_add(&subdev_fh->vfh, file);
-
-	if (sd->v4l2_dev->mdev && sd->entity.graph_obj.mdev->dev) {
-		struct module *owner;
-
-		owner = sd->entity.graph_obj.mdev->dev->driver->owner;
-		if (!try_module_get(owner)) {
-			ret = -EBUSY;
-			goto err;
-		}
-		subdev_fh->owner = owner;
-	}
 
 	if (sd->internal_ops && sd->internal_ops->open) {
 		ret = sd->internal_ops->open(sd, subdev_fh);
@@ -129,15 +145,17 @@ static int subdev_open(struct file *file)
 			goto err;
 	}
 
+	mutex_unlock(&sd->devnode_lock);
 	return 0;
 
 err:
-	module_put(subdev_fh->owner);
 	v4l2_fh_del(&subdev_fh->vfh, file);
 	v4l2_fh_exit(&subdev_fh->vfh);
 	subdev_fh_free(subdev_fh);
 	kfree(subdev_fh);
-
+unlock:
+	mutex_unlock(&sd->devnode_lock);
+	module_put(owner);
 	return ret;
 }
 
@@ -147,14 +165,18 @@ static int subdev_close(struct file *file)
 	struct v4l2_subdev *sd = vdev_to_v4l2_subdev(vdev);
 	struct v4l2_fh *vfh = file_to_v4l2_fh(file);
 	struct v4l2_subdev_fh *subdev_fh = to_v4l2_subdev_fh(vfh);
+	struct module *owner = subdev_fh->owner;
 
+	mutex_lock(&sd->devnode_lock);
 	if (sd->internal_ops && sd->internal_ops->close)
 		sd->internal_ops->close(sd, subdev_fh);
-	module_put(subdev_fh->owner);
 	v4l2_fh_del(vfh, file);
 	v4l2_fh_exit(vfh);
 	subdev_fh_free(subdev_fh);
+	mutex_unlock(&sd->devnode_lock);
 	kfree(subdev_fh);
+	/* No bridge, subdev or fh access is permitted after this final put. */
+	module_put(owner);
 
 	return 0;
 }
@@ -1149,17 +1171,34 @@ static long subdev_do_ioctl(struct file *file, unsigned int cmd, void *arg,
 static long subdev_do_ioctl_lock(struct file *file, unsigned int cmd, void *arg)
 {
 	struct video_device *vdev = video_devdata(file);
+	struct v4l2_subdev *sd = vdev_to_v4l2_subdev(vdev);
 	struct mutex *lock = vdev->lock;
+	bool devnode_locked = true;
 	long ret = -ENODEV;
 
-	if (lock && mutex_lock_interruptible(lock))
+	if (mutex_lock_interruptible(&sd->devnode_lock))
 		return -ERESTARTSYS;
+	if (lock && mutex_lock_interruptible(lock)) {
+		ret = -ERESTARTSYS;
+		goto unlock_devnode;
+	}
 
-	if (video_is_registered(vdev)) {
-		struct v4l2_subdev *sd = vdev_to_v4l2_subdev(vdev);
+	if (video_is_registered(vdev) && !sd->unregistering && sd->v4l2_dev) {
 		struct v4l2_fh *vfh = file_to_v4l2_fh(file);
 		struct v4l2_subdev_fh *subdev_fh = to_v4l2_subdev_fh(vfh);
 		struct v4l2_subdev_state *state;
+
+		if (cmd == VIDIOC_DQEVENT) {
+			/*
+			 * Event dequeue uses only the pinned fh/vdev, and drops
+			 * vdev->lock while waiting. Do not block unregistration
+			 * on an application waiting for an event.
+			 */
+			mutex_unlock(&sd->devnode_lock);
+			devnode_locked = false;
+			ret = subdev_do_ioctl(file, cmd, arg, NULL);
+			goto unlock;
+		}
 
 		state = subdev_ioctl_get_state(sd, subdev_fh, cmd, arg);
 
@@ -1172,8 +1211,12 @@ static long subdev_do_ioctl_lock(struct file *file, unsigned int cmd, void *arg)
 			v4l2_subdev_unlock_state(state);
 	}
 
+unlock:
 	if (lock)
 		mutex_unlock(lock);
+unlock_devnode:
+	if (devnode_locked)
+		mutex_unlock(&sd->devnode_lock);
 	return ret;
 }
 
@@ -1189,8 +1232,14 @@ static long subdev_compat_ioctl32(struct file *file, unsigned int cmd,
 {
 	struct video_device *vdev = video_devdata(file);
 	struct v4l2_subdev *sd = vdev_to_v4l2_subdev(vdev);
+	long ret = -ENODEV;
 
-	return v4l2_subdev_call(sd, core, compat_ioctl32, cmd, arg);
+	if (mutex_lock_interruptible(&sd->devnode_lock))
+		return -ERESTARTSYS;
+	if (video_is_registered(vdev) && !sd->unregistering && sd->v4l2_dev)
+		ret = v4l2_subdev_call(sd, core, compat_ioctl32, cmd, arg);
+	mutex_unlock(&sd->devnode_lock);
+	return ret;
 }
 #endif
 
@@ -2671,6 +2720,9 @@ EXPORT_SYMBOL_GPL(v4l2_subdev_get_frame_desc_passthrough);
 void v4l2_subdev_init(struct v4l2_subdev *sd, const struct v4l2_subdev_ops *ops)
 {
 	INIT_LIST_HEAD(&sd->list);
+	mutex_init(&sd->devnode_lock);
+	sd->devnode = NULL;
+	sd->unregistering = false;
 	BUG_ON(!ops);
 	sd->ops = ops;
 	sd->v4l2_dev = NULL;

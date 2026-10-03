@@ -13,6 +13,7 @@
 / {
 	popup_camera_motor: motor {
 		compatible = "ti,drv8846";
+		ti,hall-sensor = <&hall_sensor>;
 		pwms = <&pm8150l_lpg 4 1000000>;
 
 		mode0-gpios = <&tlmm 21 GPIO_ACTIVE_HIGH>;

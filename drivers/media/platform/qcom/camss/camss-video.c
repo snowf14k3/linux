@@ -7,6 +7,7 @@
  * Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  * Copyright (C) 2015-2018 Linaro Ltd.
  */
+#include <linux/module.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <media/media-entity.h>
@@ -53,12 +54,13 @@ static int video_mbus_to_pix_mp(const struct v4l2_mbus_framefmt *mbus,
 	pix->pixelformat = f->pixelformat;
 	pix->num_planes = f->planes;
 	for (i = 0; i < pix->num_planes; i++) {
-		bytesperline = pix->width / f->hsub[i].numerator *
-			f->hsub[i].denominator * f->bpp[i] / 8;
+		bytesperline = DIV_ROUND_UP(pix->width *
+			f->hsub[i].denominator * f->bpp[i],
+			f->hsub[i].numerator * 8);
 		bytesperline = ALIGN(bytesperline, alignment);
 		pix->plane_fmt[i].bytesperline = bytesperline;
-		pix->plane_fmt[i].sizeimage = pix->height /
-				f->vsub[i].numerator * f->vsub[i].denominator *
+		pix->plane_fmt[i].sizeimage = DIV_ROUND_UP(pix->height *
+				f->vsub[i].denominator, f->vsub[i].numerator) *
 				bytesperline;
 	}
 
@@ -270,6 +272,26 @@ static int video_prepare_streaming(struct vb2_queue *q)
 	return ret;
 }
 
+/*
+ * The caller holds q_lock. No reset acknowledgment means DMA may still use
+ * the queue. Keep its video/CAMSS object, module and device alive until reboot;
+ * closing or unregistering the node must not release the queue or its mappings.
+ */
+void camss_video_quarantine(struct camss_video *video)
+{
+	if (READ_ONCE(video->dma_quarantined))
+		return;
+
+	get_device(&video->vdev.dev);
+	get_device(video->camss->dev);
+	__module_get(THIS_MODULE);
+	WRITE_ONCE(video->dma_quarantined, true);
+	vb2_queue_error(&video->vb2_q);
+	dev_err(video->camss->dev,
+		"%s: DMA stop unconfirmed; queue retained until reboot\n",
+		video_device_node_name(&video->vdev));
+}
+
 static void video_stop_subdevices(struct camss_video *video,
 				  struct media_entity *stop_at)
 {
@@ -297,6 +319,18 @@ static void video_stop_subdevices(struct camss_video *video,
 			dev_err(video->camss->dev,
 				"Failed to stop %s: %d\n", subdev->name, ret);
 	}
+	video->subdevices_stopped = true;
+}
+
+/* Stop hardware before entering any vb2 path that can reclaim its buffers. */
+static int video_preflight_stop(struct camss_video *video)
+{
+	if (READ_ONCE(video->dma_quarantined))
+		return -EIO;
+	if (video->vb2_q.start_streaming_called && !video->subdevices_stopped)
+		video_stop_subdevices(video, NULL);
+
+	return READ_ONCE(video->dma_quarantined) ? -EIO : 0;
 }
 
 static int video_start_streaming(struct vb2_queue *q, unsigned int count)
@@ -317,6 +351,7 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 	ret = video_check_format(video);
 	if (ret < 0)
 		goto error;
+	video->subdevices_stopped = false;
 
 	entity = &vdev->entity;
 	while (1) {
@@ -341,6 +376,14 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 stop_subdevices:
 	/* The failing subdevice owns its partial-start rollback. */
 	video_stop_subdevices(video, entity);
+	if (READ_ONCE(video->dma_quarantined)) {
+		/*
+		 * An error here would make vb2_start_streaming() reclaim ACTIVE
+		 * buffers and power down the pipeline. Keep the errored queue
+		 * streaming internally; video_ioctl() reports EIO to userspace.
+		 */
+		return 0;
+	}
 error:
 	video_device_pipeline_stop(vdev);
 
@@ -355,7 +398,8 @@ static void video_stop_streaming(struct vb2_queue *q)
 	struct camss_video *video = vb2_get_drv_priv(q);
 	struct video_device *vdev = &video->vdev;
 
-	video_stop_subdevices(video, NULL);
+	if (!video->subdevices_stopped)
+		video_stop_subdevices(video, NULL);
 	video_device_pipeline_stop(vdev);
 
 	video->ops->flush_buffers(video, VB2_BUF_STATE_ERROR);
@@ -476,6 +520,14 @@ static int video_enum_framesizes(struct file *file, void *fh,
 		CAMSS_FRAME_MAX_HEIGHT_PIX : CAMSS_FRAME_MAX_HEIGHT_RDI;
 	fsize->stepwise.step_width = 1;
 	fsize->stepwise.step_height = 1;
+	if (video->camss->res->version == CAMSS_8150 && video->line_based) {
+		fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
+		fsize->stepwise.min_width = 16;
+		fsize->stepwise.max_width &= ~15U;
+		fsize->stepwise.min_height = 4;
+		fsize->stepwise.step_width = 16;
+		fsize->stepwise.step_height = 2;
+	}
 
 	return 0;
 }
@@ -498,6 +550,7 @@ static int __video_try_fmt(struct camss_video *video, struct v4l2_format *f)
 	u32 sizeimage[3] = { 0 };
 	u32 width, height;
 	u32 bpl, lines;
+	u32 bpl_max = round_down(65528U, video->bpl_alignment);
 	int i, j;
 
 	pix_mp = &f->fmt.pix_mp;
@@ -506,7 +559,7 @@ static int __video_try_fmt(struct camss_video *video, struct v4l2_format *f)
 		for (i = 0; i < pix_mp->num_planes && i < 3; i++) {
 			p = &pix_mp->plane_fmt[i];
 			bytesperline[i] = clamp_t(u32, p->bytesperline,
-						  1, 65528);
+						  1, bpl_max);
 			sizeimage[i] = clamp_t(u32, p->sizeimage,
 					       bytesperline[i],
 					       bytesperline[i] * CAMSS_FRAME_MAX_HEIGHT_PIX);
@@ -528,14 +581,22 @@ static int __video_try_fmt(struct camss_video *video, struct v4l2_format *f)
 	pix_mp->pixelformat = fi->pixelformat;
 	pix_mp->width = clamp_t(u32, width, 1, CAMSS_FRAME_MAX_WIDTH);
 	pix_mp->height = clamp_t(u32, height, 1, CAMSS_FRAME_MAX_HEIGHT_RDI);
+	if (video->camss->res->version == CAMSS_8150 && video->line_based) {
+		/* FULL writes 16-pixel groups and 4:2:0 chroma pairs. */
+		pix_mp->width = clamp_t(u32, width, 16,
+					CAMSS_FRAME_MAX_WIDTH) & ~15U;
+		pix_mp->height = clamp_t(u32, height, 4,
+					 CAMSS_FRAME_MAX_HEIGHT_PIX) & ~1U;
+	}
 	pix_mp->num_planes = fi->planes;
 	for (i = 0; i < pix_mp->num_planes; i++) {
-		bpl = pix_mp->width / fi->hsub[i].numerator *
-			fi->hsub[i].denominator * fi->bpp[i] / 8;
+		bpl = DIV_ROUND_UP(pix_mp->width *
+			fi->hsub[i].denominator * fi->bpp[i],
+			fi->hsub[i].numerator * 8);
 		bpl = ALIGN(bpl, video->bpl_alignment);
 		pix_mp->plane_fmt[i].bytesperline = bpl;
-		pix_mp->plane_fmt[i].sizeimage = pix_mp->height /
-			fi->vsub[i].numerator * fi->vsub[i].denominator * bpl;
+		pix_mp->plane_fmt[i].sizeimage = DIV_ROUND_UP(pix_mp->height *
+			fi->vsub[i].denominator, fi->vsub[i].numerator) * bpl;
 	}
 
 	pix_mp->field = V4L2_FIELD_NONE;
@@ -545,6 +606,12 @@ static int __video_try_fmt(struct camss_video *video, struct v4l2_format *f)
 	pix_mp->quantization = V4L2_MAP_QUANTIZATION_DEFAULT(true,
 					pix_mp->colorspace, pix_mp->ycbcr_enc);
 	pix_mp->xfer_func = V4L2_MAP_XFER_FUNC_DEFAULT(pix_mp->colorspace);
+	if (video->camss->res->version == CAMSS_8150 && video->line_based) {
+		/* The fixed Bayer frontend does not apply a gamma curve. */
+		pix_mp->xfer_func = V4L2_XFER_FUNC_NONE;
+		pix_mp->ycbcr_enc = V4L2_YCBCR_ENC_601;
+		pix_mp->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	}
 
 	if (video->line_based)
 		for (i = 0; i < pix_mp->num_planes; i++) {
@@ -552,14 +619,15 @@ static int __video_try_fmt(struct camss_video *video, struct v4l2_format *f)
 
 			p = &pix_mp->plane_fmt[i];
 			p->bytesperline = clamp_t(u32, p->bytesperline,
-						  1, 65528);
+						  1, bpl_max);
 			p->sizeimage = clamp_t(u32, p->sizeimage,
 					       p->bytesperline,
 					       p->bytesperline * CAMSS_FRAME_MAX_HEIGHT_PIX);
 			lines = p->sizeimage / p->bytesperline;
 
 			if (p->bytesperline < bytesperline[i])
-				p->bytesperline = ALIGN(bytesperline[i], 8);
+				p->bytesperline = ALIGN(bytesperline[i],
+						       video->bpl_alignment);
 
 			if (p->sizeimage < p->bytesperline * lines)
 				p->sizeimage = p->bytesperline * lines;
@@ -625,6 +693,27 @@ static int video_s_input(struct file *file, void *fh, unsigned int input)
 	return input == 0 ? 0 : -EINVAL;
 }
 
+static int video_streamoff(struct file *file, void *priv,
+			   enum v4l2_buf_type type)
+{
+	struct camss_video *video = video_drvdata(file);
+	int ret;
+
+	if (video->camss->res->version != CAMSS_8150)
+		return vb2_ioctl_streamoff(file, priv, type);
+	if (type != video->vb2_q.type)
+		return -EINVAL;
+	if (vb2_queue_is_busy(&video->vb2_q, file))
+		return -EBUSY;
+
+	/* video_ioctl2 holds q_lock for STREAMOFF. */
+	ret = video_preflight_stop(video);
+	if (ret)
+		return ret;
+
+	return vb2_ioctl_streamoff(file, priv, type);
+}
+
 static const struct v4l2_ioctl_ops msm_vid_ioctl_ops = {
 	.vidioc_querycap		= video_querycap,
 	.vidioc_enum_fmt_vid_cap	= video_enum_fmt,
@@ -640,7 +729,7 @@ static const struct v4l2_ioctl_ops msm_vid_ioctl_ops = {
 	.vidioc_create_bufs		= vb2_ioctl_create_bufs,
 	.vidioc_prepare_buf		= vb2_ioctl_prepare_buf,
 	.vidioc_streamon		= vb2_ioctl_streamon,
-	.vidioc_streamoff		= vb2_ioctl_streamoff,
+	.vidioc_streamoff		= video_streamoff,
 	.vidioc_enum_input		= video_enum_input,
 	.vidioc_g_input			= video_g_input,
 	.vidioc_s_input			= video_s_input,
@@ -650,11 +739,53 @@ static const struct v4l2_ioctl_ops msm_vid_ioctl_ops = {
  * V4L2 file operations
  */
 
+static int video_open(struct file *file)
+{
+	struct camss_video *video = video_drvdata(file);
+	int ret;
+
+	mutex_lock(&video->q_lock);
+	ret = READ_ONCE(video->dma_quarantined) ? -EIO : v4l2_fh_open(file);
+	mutex_unlock(&video->q_lock);
+	return ret;
+}
+
+static long video_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct camss_video *video = video_drvdata(file);
+	long ret;
+
+	if (READ_ONCE(video->dma_quarantined))
+		return -EIO;
+	ret = video_ioctl2(file, cmd, arg);
+	/* Also covers a partial start triggered by STREAMON or a late QBUF. */
+	return READ_ONCE(video->dma_quarantined) ? -EIO : ret;
+}
+
+static int video_release(struct file *file)
+{
+	struct camss_video *video = video_drvdata(file);
+	struct vb2_queue *q = &video->vb2_q;
+
+	if (video->camss->res->version != CAMSS_8150)
+		return vb2_fop_release(file);
+
+	mutex_lock(&video->q_lock);
+	if (!q->owner || file->private_data == q->owner) {
+		if (!video_preflight_stop(video))
+			vb2_queue_release(q);
+		/* The queue stays allocated on a DMA failure, without a dead fh. */
+		q->owner = NULL;
+	}
+	mutex_unlock(&video->q_lock);
+	return v4l2_fh_release(file);
+}
+
 static const struct v4l2_file_operations msm_vid_fops = {
 	.owner          = THIS_MODULE,
-	.unlocked_ioctl = video_ioctl2,
-	.open           = v4l2_fh_open,
-	.release        = vb2_fop_release,
+	.unlocked_ioctl = video_ioctl,
+	.open           = video_open,
+	.release        = video_release,
 	.poll           = vb2_fop_poll,
 	.mmap		= vb2_fop_mmap,
 	.read		= vb2_fop_read,
@@ -736,6 +867,9 @@ int msm_video_register(struct camss_video *video, struct v4l2_device *v4l2_dev,
 	q->ops = &msm_video_vb2_q_ops;
 	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	q->io_modes = VB2_DMABUF | VB2_MMAP | VB2_READ;
+	if (video->camss->res->version == CAMSS_8150)
+		/* The read() emulator can cancel internally, bypassing preflight. */
+		q->io_modes &= ~VB2_READ;
 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 	q->buf_struct_size = sizeof(struct camss_buffer);
 	q->dev = video->camss->dev;
@@ -765,6 +899,8 @@ int msm_video_register(struct camss_video *video, struct v4l2_device *v4l2_dev,
 	vdev->fops = &msm_vid_fops;
 	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE_MPLANE | V4L2_CAP_STREAMING
 			  | V4L2_CAP_READWRITE | V4L2_CAP_IO_MC;
+	if (video->camss->res->version == CAMSS_8150)
+		vdev->device_caps &= ~V4L2_CAP_READWRITE;
 	vdev->ioctl_ops = &msm_vid_ioctl_ops;
 	vdev->release = msm_video_release;
 	vdev->v4l2_dev = v4l2_dev;
@@ -796,7 +932,23 @@ error_vb2_init:
 
 void msm_video_unregister(struct camss_video *video)
 {
+	struct video_device *vdev = &video->vdev;
+
 	atomic_inc(&video->camss->ref_count);
-	vb2_video_unregister_device(&video->vdev);
+	if (video->camss->res->version == CAMSS_8150 &&
+	    video_is_registered(vdev)) {
+		/* Match vb2_video_unregister_device(), with a DMA preflight. */
+		get_device(&vdev->dev);
+		video_unregister_device(vdev);
+		mutex_lock(&video->q_lock);
+		if (!video_preflight_stop(video)) {
+			vb2_queue_release(&video->vb2_q);
+			video->vb2_q.owner = NULL;
+		}
+		mutex_unlock(&video->q_lock);
+		put_device(&vdev->dev);
+	} else {
+		vb2_video_unregister_device(vdev);
+	}
 	atomic_dec(&video->camss->ref_count);
 }

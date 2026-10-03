@@ -7,7 +7,11 @@
  * power in IRQ context; PWM shutdown is then completed in process context.
  */
 
+#include <linux/akm09970.h>
+#include <linux/capability.h>
 #include <linux/compat.h>
+#include <linux/delay.h>
+#include <linux/drv8846.h>
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/gpio/consumer.h>
@@ -17,10 +21,12 @@
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/kref.h>
+#include <linux/limits.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/poll.h>
@@ -28,7 +34,9 @@
 #include <linux/signal.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/timekeeping.h>
 #include <linux/uaccess.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
 #include <uapi/misc/drv8846.h>
@@ -38,9 +46,17 @@
 #define DRV8846_MAX_MOVE_MS	1500U
 #define DRV8846_DOWN_EXTRA_MS	5U
 #define DRV8846_WATCHDOG_GRACE_JIFFIES	2U
+/* Three periods at the slowest supported Hall acquisition rate. */
+#define DRV8846_HALL_READY_MS	300U
+#define DRV8846_HALL_POLL_MS	10U
 
 struct drv8846 {
 	struct device *dev;
+	struct akm09970 *hall;
+	struct drv8846_calibration calibration;
+	bool calibration_valid;
+	bool camera_owned;
+	bool camera_cancelled;
 	struct miscdevice miscdev;
 	struct kref ref;
 	struct mutex lock;
@@ -80,6 +96,8 @@ struct drv8846 {
 	int fault_irq;
 };
 
+static struct platform_driver drv8846_driver;
+
 static void drv8846_release_ref(struct kref *ref)
 {
 	struct drv8846 *motor = container_of(ref, struct drv8846, ref);
@@ -110,7 +128,7 @@ static void drv8846_cut_power(struct drv8846 *motor, u32 reason)
 	spin_lock_irqsave(&motor->safety_lock, flags);
 	if (reason == DRV8846_STOP_FAULT)
 		motor->fault_latched = true;
-	if (reason == DRV8846_STOP_TIMEOUT)
+	if (reason == DRV8846_STOP_TIMEOUT || reason == DRV8846_STOP_NO_POSITION)
 		motor->timeout_latched = true;
 	drv8846_cut_power_locked(motor, reason);
 	spin_unlock_irqrestore(&motor->safety_lock, flags);
@@ -287,7 +305,7 @@ out:
 	mutex_unlock(&motor->lock);
 }
 
-static int drv8846_start(struct drv8846 *motor, u32 direction,
+static int drv8846_start_locked(struct drv8846 *motor, u32 direction,
 			 u32 period_ns, u32 duration_ms, bool automatic)
 {
 	unsigned long flags;
@@ -303,7 +321,6 @@ static int drv8846_start(struct drv8846 *motor, u32 direction,
 	if (!duration_ms || duration_ms > DRV8846_MAX_MOVE_MS)
 		return -EINVAL;
 
-	mutex_lock(&motor->command_lock);
 	if (READ_ONCE(motor->removing) || READ_ONCE(motor->suspended)) {
 		ret = -ENODEV;
 		goto out_command;
@@ -312,8 +329,12 @@ static int drv8846_start(struct drv8846 *motor, u32 direction,
 		ret = -ECANCELED;
 		goto out_command;
 	}
-	if (READ_ONCE(motor->cutoff_failed)) {
+	if (READ_ONCE(motor->cutoff_failed) || READ_ONCE(motor->fault_latched)) {
 		ret = -EIO;
+		goto out_command;
+	}
+	if (READ_ONCE(motor->timeout_latched)) {
+		ret = -ETIMEDOUT;
 		goto out_command;
 	}
 
@@ -338,11 +359,6 @@ static int drv8846_start(struct drv8846 *motor, u32 direction,
 
 	drv8846_stop_locked(motor, DRV8846_STOP_ABORTED);
 	atomic_set(&motor->move_done, 0);
-
-	spin_lock_irqsave(&motor->safety_lock, flags);
-	motor->fault_latched = false;
-	motor->timeout_latched = false;
-	spin_unlock_irqrestore(&motor->safety_lock, flags);
 
 	ret = gpiod_get_value_cansleep(motor->fault);
 	if (ret < 0)
@@ -412,7 +428,6 @@ static int drv8846_start(struct drv8846 *motor, u32 direction,
 			 msecs_to_jiffies(automatic ?
 					motor->rampup_duration_ms : duration_ms));
 	mutex_unlock(&motor->lock);
-	mutex_unlock(&motor->command_lock);
 
 	return 0;
 
@@ -423,9 +438,377 @@ out_stop:
 out_unlock:
 	mutex_unlock(&motor->lock);
 out_command:
+	return ret;
+}
+
+/* command_lock excludes configuration changes and competing movements. */
+static void drv8846_quiesce(struct drv8846 *motor, u32 reason)
+{
+	drv8846_cut_power(motor, reason);
+	hrtimer_cancel(&motor->watchdog);
+	cancel_delayed_work_sync(&motor->phase_work);
+	cancel_work_sync(&motor->stop_work);
+	mutex_lock(&motor->lock);
+	drv8846_stop_locked(motor, reason);
+	mutex_unlock(&motor->lock);
+}
+
+static int drv8846_check_available(struct drv8846 *motor)
+{
+	if (READ_ONCE(motor->removing))
+		return -ENODEV;
+	if (READ_ONCE(motor->suspended))
+		return -EBUSY;
+	if (READ_ONCE(motor->pending_stops))
+		return -ECANCELED;
+	if (READ_ONCE(motor->cutoff_failed))
+		return -EIO;
+	return 0;
+}
+
+static int drv8846_check_safe(struct drv8846 *motor)
+{
+	int ret = drv8846_check_available(motor);
+
+	if (ret)
+		return ret;
+	if (READ_ONCE(motor->fault_latched))
+		return -EIO;
+	if (READ_ONCE(motor->timeout_latched))
+		return -ETIMEDOUT;
+	ret = gpiod_get_value_cansleep(motor->fault);
+	return ret < 0 ? ret : ret ? -EIO : 0;
+}
+
+static u32 drv8846_classify(struct drv8846 *motor,
+			    const struct akm09970_sample_snapshot *sample)
+{
+	const struct drv8846_calibration *cal = &motor->calibration;
+	bool match;
+	int endpoint, axis, value;
+
+	for (endpoint = 0; endpoint < 2; endpoint++) {
+		match = true;
+		for (axis = 0; axis < 3; axis++) {
+			/* Downstream MAKE_S16 uses MSB then LSB. */
+			value = (s16)get_unaligned_be16(&sample->data[2 + 2 * axis]);
+			if (value < cal->minimum[endpoint][axis] ||
+			    value > cal->maximum[endpoint][axis])
+				match = false;
+		}
+		if (match)
+			return endpoint == DOWN ? DRV8846_POSITION_DOWN :
+						  DRV8846_POSITION_UP;
+	}
+	return DRV8846_POSITION_UNKNOWN;
+}
+
+/* Two distinct samples acquired after entry; cached samples never suffice. */
+static int drv8846_position_locked(struct drv8846 *motor, u32 *position)
+{
+	struct akm09970_sample_snapshot sample;
+	u64 since = ktime_get_boottime_ns();
+	ktime_t deadline = ktime_add_ms(ktime_get(), DRV8846_HALL_READY_MS);
+	u32 previous = DRV8846_POSITION_UNKNOWN, sequence = 0;
+	bool have_sample = false;
+	int ret;
+
+	for (;;) {
+		ret = drv8846_check_safe(motor);
+		if (ret)
+			return ret;
+		ret = akm09970_snapshot(motor->hall, &sample);
+		if (ret && ret != -ENODATA)
+			return ret;
+		if (!ret && sample.timestamp_ns >= since &&
+		    (!have_sample || sample.sequence != sequence)) {
+			*position = drv8846_classify(motor, &sample);
+			if (have_sample && *position == previous)
+				return *position == DRV8846_POSITION_UNKNOWN ?
+					-ERANGE : 0;
+			sequence = sample.sequence;
+			previous = *position;
+			have_sample = true;
+		}
+		if (ktime_compare(ktime_get(), deadline) >= 0)
+			return -ETIMEDOUT;
+		msleep(DRV8846_HALL_POLL_MS);
+	}
+}
+
+static int drv8846_move_checked_locked(struct drv8846 *motor, u32 direction)
+{
+	struct akm09970_sample_snapshot sample;
+	u32 target, position, sequence = 0;
+	u32 reason = DRV8846_STOP_HALL_ERROR;
+	unsigned int stable = 0;
+	u64 since;
+	ktime_t deadline;
+	unsigned long flags;
+	int ret;
+
+	if (direction != UP && direction != DOWN)
+		return -EINVAL;
+	ret = drv8846_check_safe(motor);
+	if (ret)
+		return ret;
+	if (!motor->calibration_valid)
+		return -ENODATA;
+	if (!motor->hall)
+		return -ENODEV;
+	if (drv8846_is_armed(motor))
+		return -EBUSY;
+	ret = akm09970_acquire(motor->hall);
+	if (ret)
+		return ret;
+	ret = drv8846_position_locked(motor, &position);
+	if (ret)
+		goto release;
+	target = direction == UP ? DRV8846_POSITION_UP : DRV8846_POSITION_DOWN;
+	if (position == target)
+		goto release;
+
+	since = ktime_get_boottime_ns();
+	deadline = ktime_add_ms(ktime_get(), DRV8846_MAX_MOVE_MS);
+	ret = drv8846_start_locked(motor, direction, motor->rampup_period_ns,
+				   motor->rampup_duration_ms, true);
+	if (ret)
+		goto release;
+	for (;;) {
+		if (ktime_compare(ktime_get(), deadline) >= 0) {
+			ret = -ETIMEDOUT;
+			reason = DRV8846_STOP_TIMEOUT;
+			break;
+		}
+		ret = drv8846_check_safe(motor);
+		if (ret) {
+			reason = DRV8846_STOP_ABORTED;
+			break;
+		}
+		if (!drv8846_is_armed(motor)) {
+			ret = READ_ONCE(motor->fault_latched) ? -EIO : -ETIMEDOUT;
+			reason = DRV8846_STOP_NO_POSITION;
+			break;
+		}
+		ret = akm09970_snapshot(motor->hall, &sample);
+		if (ret)
+			break;
+		if (sample.timestamp_ns >= since && sample.sequence != sequence) {
+			sequence = sample.sequence;
+			position = drv8846_classify(motor, &sample);
+			stable = position == target ? stable + 1 : 0;
+			if (stable >= 2) {
+				reason = DRV8846_STOP_POSITION;
+				break;
+			}
+		}
+		msleep(DRV8846_HALL_POLL_MS);
+	}
+	if (reason == DRV8846_STOP_NO_POSITION) {
+		spin_lock_irqsave(&motor->safety_lock, flags);
+		if (motor->last_stop_reason == DRV8846_STOP_TIMED)
+			motor->last_stop_reason = reason;
+		spin_unlock_irqrestore(&motor->safety_lock, flags);
+	}
+	drv8846_quiesce(motor, reason);
+	/* An IRQ/suspend may win immediately before the confirmed cutoff. */
+	if (!ret && READ_ONCE(motor->last_stop_reason) != DRV8846_STOP_POSITION)
+		ret = -EIO;
+	if (!ret && READ_ONCE(motor->cutoff_failed))
+		ret = -EIO;
+	/* Confirm again with the bridge off; motion-time detection is not final. */
+	if (!ret) {
+		ret = drv8846_position_locked(motor, &position);
+		if (!ret && position != target)
+			ret = -ERANGE;
+		if (ret) {
+			spin_lock_irqsave(&motor->safety_lock, flags);
+			if (ret == -ERANGE || ret == -ETIMEDOUT)
+				motor->timeout_latched = true;
+			if (motor->last_stop_reason == DRV8846_STOP_POSITION)
+				motor->last_stop_reason = ret == -ERANGE ?
+					DRV8846_STOP_NO_POSITION : DRV8846_STOP_HALL_ERROR;
+			spin_unlock_irqrestore(&motor->safety_lock, flags);
+		}
+	}
+release:
+	if (!ret)
+		ret = drv8846_check_safe(motor);
+	akm09970_release(motor->hall);
+	return ret;
+}
+
+static int drv8846_start(struct drv8846 *motor, u32 direction,
+			u32 period_ns, u32 duration_ms, bool automatic)
+{
+	int ret;
+
+	mutex_lock(&motor->command_lock);
+	if (motor->camera_owned)
+		ret = -EBUSY;
+	else if (automatic)
+		ret = drv8846_move_checked_locked(motor, direction);
+	else
+		ret = drv8846_start_locked(motor, direction, period_ns,
+					   duration_ms, false);
 	mutex_unlock(&motor->command_lock);
 	return ret;
 }
+
+static bool drv8846_valid_calibration(const struct drv8846_calibration *cal)
+{
+	bool disjoint = false;
+	int endpoint, axis;
+
+	if (cal->version != DRV8846_CALIBRATION_VERSION ||
+	    cal->flags != DRV8846_CALIBRATION_DEVICE_VERIFIED ||
+	    memchr_inv(cal->reserved, 0, sizeof(cal->reserved)))
+		return false;
+	for (axis = 0; axis < 3; axis++) {
+		for (endpoint = 0; endpoint < 2; endpoint++) {
+			if (cal->minimum[endpoint][axis] < S16_MIN ||
+			    cal->maximum[endpoint][axis] > S16_MAX ||
+			    cal->minimum[endpoint][axis] > cal->maximum[endpoint][axis])
+				return false;
+		}
+		if (cal->maximum[DOWN][axis] < cal->minimum[UP][axis] ||
+		    cal->maximum[UP][axis] < cal->minimum[DOWN][axis])
+			disjoint = true;
+	}
+	return disjoint;
+}
+
+struct drv8846 *drv8846_get(struct device *consumer, const char *property)
+{
+	struct device_node *np;
+	struct platform_device *pdev;
+	struct drv8846 *motor;
+	int ret = -EPROBE_DEFER;
+
+	np = of_parse_phandle(consumer->of_node, property, 0);
+	if (!np)
+		return ERR_PTR(-ENODEV);
+	pdev = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!pdev)
+		return ERR_PTR(-EPROBE_DEFER);
+	device_lock(&pdev->dev);
+	motor = platform_get_drvdata(pdev);
+	if (pdev->dev.driver != &drv8846_driver.driver || !motor ||
+	    READ_ONCE(motor->removing))
+		goto unlock;
+	if (!try_module_get(THIS_MODULE))
+		goto unlock;
+	if (!device_link_add(consumer, &pdev->dev,
+			     DL_FLAG_AUTOREMOVE_CONSUMER)) {
+		module_put(THIS_MODULE);
+		ret = -ENOMEM;
+		goto unlock;
+	}
+	kref_get(&motor->ref);
+	device_unlock(&pdev->dev);
+	return motor;
+unlock:
+	device_unlock(&pdev->dev);
+	put_device(&pdev->dev);
+	return ERR_PTR(ret);
+}
+EXPORT_SYMBOL_GPL(drv8846_get);
+
+void drv8846_put(struct drv8846 *motor)
+{
+	put_device(motor->dev);
+	kref_put(&motor->ref, drv8846_release_ref);
+	module_put(THIS_MODULE);
+}
+EXPORT_SYMBOL_GPL(drv8846_put);
+
+int drv8846_camera_open(struct drv8846 *motor)
+{
+	int ret;
+
+	mutex_lock(&motor->command_lock);
+	if (motor->camera_owned)
+		ret = -EBUSY;
+	else {
+		ret = drv8846_move_checked_locked(motor, UP);
+		if (!ret) {
+			motor->camera_owned = true;
+			motor->camera_cancelled = false;
+		}
+	}
+	mutex_unlock(&motor->command_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(drv8846_camera_open);
+
+int drv8846_camera_ready(struct drv8846 *motor)
+{
+	u32 position;
+	int ret;
+
+	mutex_lock(&motor->command_lock);
+	ret = drv8846_check_safe(motor);
+	if (ret)
+		goto unlock;
+	if (!motor->camera_owned) {
+		ret = -EPIPE;
+		goto unlock;
+	}
+	if (motor->camera_cancelled) {
+		ret = -ECANCELED;
+		goto unlock;
+	}
+	if (!motor->calibration_valid || !motor->hall) {
+		ret = -ENODATA;
+		goto unlock;
+	}
+	ret = akm09970_acquire(motor->hall);
+	if (ret)
+		goto unlock;
+	ret = drv8846_position_locked(motor, &position);
+	if (!ret && position != DRV8846_POSITION_UP)
+		ret = -ERANGE;
+	if (!ret)
+		ret = drv8846_check_safe(motor);
+	akm09970_release(motor->hall);
+unlock:
+	mutex_unlock(&motor->command_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(drv8846_camera_ready);
+
+int drv8846_camera_close(struct drv8846 *motor)
+{
+	int ret = 0;
+
+	mutex_lock(&motor->command_lock);
+	if (motor->camera_owned) {
+		if (motor->camera_cancelled)
+			ret = -ECANCELED;
+		else
+			ret = drv8846_move_checked_locked(motor, DOWN);
+	}
+	motor->camera_owned = false;
+	mutex_unlock(&motor->command_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(drv8846_camera_close);
+
+void drv8846_camera_abort(struct drv8846 *motor)
+{
+	bool stop = drv8846_request_stop(motor, false, false);
+
+	mutex_lock(&motor->command_lock);
+	if (stop) {
+		if (!READ_ONCE(motor->removing))
+			drv8846_quiesce(motor, DRV8846_STOP_ABORTED);
+		drv8846_finish_stop_request(motor);
+	}
+	motor->camera_owned = false;
+	mutex_unlock(&motor->command_lock);
+}
+EXPORT_SYMBOL_GPL(drv8846_camera_abort);
 
 static int drv8846_fasync(int fd, struct file *file, int on)
 {
@@ -498,6 +881,8 @@ static long drv8846_ioctl(struct file *file, unsigned int cmd,
 {
 	struct drv8846 *motor = file->private_data;
 	struct op_parameter params;
+	struct drv8846_calibration calibration;
+	u32 position;
 	enum running_state state;
 	unsigned long flags;
 	u32 reason;
@@ -509,6 +894,69 @@ static long drv8846_ioctl(struct file *file, unsigned int cmd,
 		return -ENODEV;
 
 	switch (cmd) {
+	case MOTOR_IOC_SET_CALIBRATION:
+	case MOTOR_IOC_CLEAR_CALIBRATION:
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		if (cmd == MOTOR_IOC_SET_CALIBRATION) {
+			if (copy_from_user(&calibration, (void __user *)arg,
+					   sizeof(calibration)))
+				return -EFAULT;
+			if (!drv8846_valid_calibration(&calibration))
+				return -EINVAL;
+		}
+		mutex_lock(&motor->command_lock);
+		ret = drv8846_check_available(motor);
+		if (!ret && (motor->camera_owned || drv8846_is_armed(motor)))
+			ret = -EBUSY;
+		if (!ret) {
+			motor->calibration_valid = cmd == MOTOR_IOC_SET_CALIBRATION;
+			if (motor->calibration_valid)
+				motor->calibration = calibration;
+			else
+				memset(&motor->calibration, 0, sizeof(motor->calibration));
+		}
+		mutex_unlock(&motor->command_lock);
+		return ret;
+	case MOTOR_IOC_CLEAR_FAULTS:
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		mutex_lock(&motor->command_lock);
+		ret = drv8846_check_available(motor);
+		if (!ret && (motor->camera_owned || drv8846_is_armed(motor)))
+			ret = -EBUSY;
+		if (!ret) {
+			spin_lock_irqsave(&motor->safety_lock, flags);
+			ret = gpiod_get_value(motor->fault);
+			if (!ret) {
+				motor->fault_latched = false;
+				motor->timeout_latched = false;
+			} else if (ret > 0) {
+				ret = -EIO;
+			}
+			spin_unlock_irqrestore(&motor->safety_lock, flags);
+		}
+		mutex_unlock(&motor->command_lock);
+		return ret;
+	case MOTOR_IOC_GET_POSITION:
+		mutex_lock(&motor->command_lock);
+		ret = drv8846_check_available(motor);
+		if (!ret && (!motor->calibration_valid || !motor->hall))
+			ret = -ENODATA;
+		if (!ret && drv8846_is_armed(motor))
+			ret = -EBUSY;
+		if (!ret) {
+			ret = akm09970_acquire(motor->hall);
+			if (!ret) {
+				ret = drv8846_position_locked(motor, &position);
+				akm09970_release(motor->hall);
+			}
+		}
+		mutex_unlock(&motor->command_lock);
+		if (ret)
+			return ret;
+		return copy_to_user((void __user *)arg, &position,
+				    sizeof(position)) ? -EFAULT : 0;
 	case MOTOR_IOC_SET_AUTORUN:
 		if (copy_from_user(&direction, (void __user *)arg,
 				   sizeof(direction)))
@@ -528,6 +976,9 @@ static long drv8846_ioctl(struct file *file, unsigned int cmd,
 		mutex_lock(&motor->command_lock);
 		ret = READ_ONCE(motor->removing) ? -ENODEV : 0;
 		if (!ret) {
+			/* STOP cancels later motion, retaining camera exclusivity. */
+			if (motor->camera_owned)
+				motor->camera_cancelled = true;
 			hrtimer_cancel(&motor->watchdog);
 			cancel_delayed_work_sync(&motor->phase_work);
 			cancel_work_sync(&motor->stop_work);
@@ -550,6 +1001,14 @@ static long drv8846_ioctl(struct file *file, unsigned int cmd,
 		if (copy_to_user((void __user *)arg, &state, sizeof(state)))
 			return -EFAULT;
 		return 0;
+	case MOTOR_IOC_GET_CAMERA_STATE:
+		mutex_lock(&motor->command_lock);
+		reason = motor->camera_owned ? DRV8846_CAMERA_OWNED : 0;
+		if (motor->camera_owned && motor->camera_cancelled)
+			reason |= DRV8846_CAMERA_CANCELLED;
+		mutex_unlock(&motor->command_lock);
+		return copy_to_user((void __user *)arg, &reason,
+				    sizeof(reason)) ? -EFAULT : 0;
 	case MOTOR_IOC_GET_STOP_REASON:
 		spin_lock_irqsave(&motor->safety_lock, flags);
 		reason = motor->last_stop_reason;
@@ -665,6 +1124,16 @@ static int drv8846_probe(struct platform_device *pdev)
 	hrtimer_setup(&motor->watchdog, drv8846_watchdog,
 		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 
+	if (of_find_property(dev->of_node, "ti,hall-sensor", NULL)) {
+		motor->hall = akm09970_get(dev, "ti,hall-sensor");
+		if (IS_ERR(motor->hall)) {
+			ret = dev_err_probe(dev, PTR_ERR(motor->hall),
+					    "failed to acquire Hall sensor\n");
+			motor->hall = NULL;
+			goto err_free;
+		}
+	}
+
 	ret = drv8846_read_config(dev, motor);
 	if (ret)
 		goto err_free;
@@ -706,9 +1175,10 @@ static int drv8846_probe(struct platform_device *pdev)
 		goto err_free;
 	}
 
-	if (gpiod_cansleep(motor->sleep) || gpiod_cansleep(motor->enable)) {
+	if (gpiod_cansleep(motor->sleep) || gpiod_cansleep(motor->enable) ||
+	    gpiod_cansleep(motor->fault)) {
 		ret = dev_err_probe(dev, -EINVAL,
-				    "motor cutoff GPIOs must be IRQ-safe\n");
+				    "motor safety GPIOs must be IRQ-safe\n");
 		goto err_free;
 	}
 
@@ -753,6 +1223,8 @@ err_free:
 		devm_free_irq(dev, motor->fault_irq, motor);
 		cancel_work_sync(&motor->stop_work);
 	}
+	if (motor->hall)
+		akm09970_put(motor->hall);
 	kfree(motor);
 	return ret;
 }
@@ -772,6 +1244,11 @@ static void drv8846_remove(struct platform_device *pdev)
 	mutex_lock(&motor->lock);
 	drv8846_stop_locked(motor, DRV8846_STOP_ABORTED);
 	mutex_unlock(&motor->lock);
+	motor->camera_owned = false;
+	if (motor->hall) {
+		akm09970_put(motor->hall);
+		motor->hall = NULL;
+	}
 	mutex_unlock(&motor->command_lock);
 
 	wake_up_interruptible_poll(&motor->waitq, EPOLLHUP);
@@ -792,6 +1269,7 @@ static void drv8846_shutdown(struct platform_device *pdev)
 	mutex_lock(&motor->lock);
 	drv8846_stop_locked(motor, DRV8846_STOP_ABORTED);
 	mutex_unlock(&motor->lock);
+	motor->camera_owned = false;
 	mutex_unlock(&motor->command_lock);
 }
 
@@ -809,6 +1287,7 @@ static int drv8846_suspend(struct device *dev)
 	mutex_lock(&motor->lock);
 	drv8846_stop_locked(motor, DRV8846_STOP_ABORTED);
 	mutex_unlock(&motor->lock);
+	motor->camera_owned = false;
 	mutex_unlock(&motor->command_lock);
 
 	return 0;

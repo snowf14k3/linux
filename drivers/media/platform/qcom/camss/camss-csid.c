@@ -589,7 +589,9 @@ static int csid_set_clock_rates(struct csid_device *csid)
 				return ret;
 			}
 		} else if (clock->nfreqs) {
-			clk_set_rate(clock->clk, clock->freq[0]);
+			ret = clk_set_rate(clock->clk, clock->freq[0]);
+			if (ret < 0)
+				return ret;
 		}
 	}
 
@@ -632,7 +634,9 @@ u32 csid_hw_version(struct csid_device *csid)
 u32 csid_src_pad_code(struct csid_device *csid, u32 sink_code,
 		      unsigned int match_format_idx, u32 match_code)
 {
-	if (csid->camss->res->version == CAMSS_8x16) {
+	/* SM8150 RDI forwards CSI payload bytes without unpacking. */
+	if (csid->camss->res->version == CAMSS_8x16 ||
+	    csid->camss->res->version == CAMSS_8150) {
 		if (match_format_idx > 0)
 			return 0;
 
@@ -753,10 +757,6 @@ put_parent:
 static int csid_set_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct csid_device *csid = v4l2_get_subdevdata(sd);
-	bool full_ipp = csid->camss->res->version == CAMSS_8150 &&
-			!csid->res->is_lite &&
-			(csid->phy.en_vc & BIT(MSM_CSID_PAD_SRC_3 -
-					       MSM_CSID_PAD_FIRST_SRC));
 	int ret;
 
 	if (enable) {
@@ -780,8 +780,14 @@ static int csid_set_stream(struct v4l2_subdev *sd, int enable)
 		}
 	}
 
-	/* IPP must halt and resume on every stream transition. */
-	if (csid->phy.need_vc_update || full_ipp) {
+	/* SM8150 permits one path, which must halt/resume on every transition. */
+	if (csid->phy.need_vc_update ||
+	    csid->camss->res->version == CAMSS_8150) {
+		if (!enable && csid->camss->res->version == CAMSS_8150 &&
+		    csid->res->hw_ops->stop_stream) {
+			csid->phy.need_vc_update = true;
+			return csid->res->hw_ops->stop_stream(csid);
+		}
 		csid->res->hw_ops->configure_stream(csid, enable);
 		csid->phy.need_vc_update = false;
 	}
@@ -846,7 +852,7 @@ static void csid_try_format(struct csid_device *csid,
 
 		break;
 
-	case MSM_CSID_PAD_SRC:
+	case MSM_CSID_PAD_FIRST_SRC ... MSM_CSID_PADS_NUM - 1:
 		if (csid->testgen.nmodes == CSID_PAYLOAD_MODE_DISABLED ||
 		    csid->testgen_mode->cur.val == 0) {
 			/* Test generator is disabled, */
@@ -997,6 +1003,11 @@ static int csid_set_format(struct v4l2_subdev *sd,
 	struct csid_device *csid = v4l2_get_subdevdata(sd);
 	struct v4l2_mbus_framefmt *format;
 	int i;
+
+	if (csid->camss->res->version == CAMSS_8150 &&
+	    fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE &&
+	    media_entity_is_streaming(&sd->entity))
+		return -EBUSY;
 
 	format = __csid_get_format(csid, sd_state, fmt->pad, fmt->which);
 	if (format == NULL)
@@ -1289,6 +1300,11 @@ static int csid_link_setup(struct media_entity *entity,
 		struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(entity);
 		struct csid_device *csid = v4l2_get_subdevdata(sd);
 		struct device *dev = csid->camss->dev;
+
+		/* Legacy s_stream has no per-path ownership or shared stream count. */
+		if ((flags & MEDIA_LNK_FL_ENABLED) &&
+		    csid->camss->res->version == CAMSS_8150 && csid->phy.en_vc)
+			return -EBUSY;
 
 		if (flags & MEDIA_LNK_FL_ENABLED)
 			csid->phy.en_vc |= BIT(local->index - 1);

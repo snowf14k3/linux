@@ -85,9 +85,11 @@ void v4l2_device_disconnect(struct v4l2_device *v4l2_dev)
 }
 EXPORT_SYMBOL_GPL(v4l2_device_disconnect);
 
+static void v4l2_subdev_release(struct v4l2_subdev *sd);
+
 void v4l2_device_unregister(struct v4l2_device *v4l2_dev)
 {
-	struct v4l2_subdev *sd, *next;
+	struct v4l2_subdev *sd;
 
 	/* Just return if v4l2_dev is NULL or if it was already
 	 * unregistered before. */
@@ -95,13 +97,19 @@ void v4l2_device_unregister(struct v4l2_device *v4l2_dev)
 		return;
 	v4l2_device_disconnect(v4l2_dev);
 
-	/* Unregister subdevs */
-	list_for_each_entry_safe(sd, next, &v4l2_dev->subdevs, list) {
+	/*
+	 * A callback can remove other subdevs, so do not cache the next one.
+	 * Keep sd alive until the I2C/SPI teardown has finished using it.
+	 */
+	while (!list_empty(&v4l2_dev->subdevs)) {
+		sd = list_first_entry(&v4l2_dev->subdevs, struct v4l2_subdev, list);
+		kref_get(&sd->framework_ref);
 		v4l2_device_unregister_subdev(sd);
 		if (sd->flags & V4L2_SUBDEV_FL_IS_I2C)
 			v4l2_i2c_subdev_unregister(sd);
 		else if (sd->flags & V4L2_SUBDEV_FL_IS_SPI)
 			v4l2_spi_subdev_unregister(sd);
+		v4l2_subdev_release(sd);
 	}
 	/* Mark as unregistered, thus preventing duplicate unregistrations */
 	v4l2_dev->name[0] = '\0';
@@ -116,6 +124,14 @@ int __v4l2_device_register_subdev(struct v4l2_device *v4l2_dev,
 	/* Check for valid input */
 	if (!v4l2_dev || !sd || sd->v4l2_dev || !sd->name[0])
 		return -EINVAL;
+	/* Registration/list changes remain serialized by the bridge driver. */
+	mutex_lock(&sd->devnode_lock);
+	if (sd->devnode || sd->unregistering) {
+		mutex_unlock(&sd->devnode_lock);
+		return -EBUSY;
+	}
+	mutex_unlock(&sd->devnode_lock);
+	kref_init(&sd->framework_ref);
 
 	/*
 	 * The reason to acquire the module here is to avoid unloading
@@ -166,25 +182,41 @@ error_unregister:
 #endif
 error_module:
 	if (!sd->owner_v4l2_dev)
-		module_put(sd->owner);
+		module_put(module);
 	sd->v4l2_dev = NULL;
 	return err;
 }
 EXPORT_SYMBOL_GPL(__v4l2_device_register_subdev);
 
-static void v4l2_subdev_release(struct v4l2_subdev *sd)
+static void v4l2_subdev_release_final(struct kref *ref)
 {
+	struct v4l2_subdev *sd = container_of(ref, struct v4l2_subdev, framework_ref);
 	struct module *owner = !sd->owner_v4l2_dev ? sd->owner : NULL;
 
+	mutex_lock(&sd->devnode_lock);
+	/* The release callback may free the memory containing sd. */
+	sd->devnode = NULL;
+	sd->unregistering = false;
+	mutex_unlock(&sd->devnode_lock);
 	if (sd->internal_ops && sd->internal_ops->release)
 		sd->internal_ops->release(sd);
-	sd->devnode = NULL;
 	module_put(owner);
+}
+
+static void v4l2_subdev_release(struct v4l2_subdev *sd)
+{
+	kref_put(&sd->framework_ref, v4l2_subdev_release_final);
 }
 
 static void v4l2_device_release_subdev_node(struct video_device *vdev)
 {
-	v4l2_subdev_release(video_get_drvdata(vdev));
+	struct v4l2_subdev *sd = video_get_drvdata(vdev);
+
+	/* A bridge teardown hold may outlive the video_device itself. */
+	mutex_lock(&sd->devnode_lock);
+	sd->devnode = NULL;
+	mutex_unlock(&sd->devnode_lock);
+	v4l2_subdev_release(sd);
 	kfree(vdev);
 }
 
@@ -202,13 +234,25 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
 		if (!(sd->flags & V4L2_SUBDEV_FL_HAS_DEVNODE))
 			continue;
 
-		if (sd->devnode)
+		mutex_lock(&sd->devnode_lock);
+		if (sd->unregistering || sd->v4l2_dev != v4l2_dev) {
+			err = -ENODEV;
+			goto unlock;
+		}
+		if (sd->devnode) {
+			/* A failed batch must be unregistered before retrying. */
+			if (!video_is_registered(sd->devnode)) {
+				err = -EBUSY;
+				goto unlock;
+			}
+			mutex_unlock(&sd->devnode_lock);
 			continue;
+		}
 
 		vdev = kzalloc_obj(*vdev);
 		if (!vdev) {
 			err = -ENOMEM;
-			goto clean_up;
+			goto unlock;
 		}
 
 		video_set_drvdata(vdev, sd);
@@ -226,8 +270,14 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
 		if (err < 0) {
 			sd->devnode = NULL;
 			kfree(vdev);
-			goto clean_up;
+			goto unlock;
 		}
+		/*
+		 * Keep the node alive until subdev unregistration. A partial
+		 * batch failure may unregister the node first, but must not
+		 * release the still-registered subdev or its module reference.
+		 */
+		get_device(&vdev->dev);
 #if defined(CONFIG_MEDIA_CONTROLLER)
 		sd->entity.info.dev.major = VIDEO_MAJOR;
 		sd->entity.info.dev.minor = vdev->minor;
@@ -242,18 +292,21 @@ int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
 						      MEDIA_LNK_FL_IMMUTABLE);
 			if (!link) {
 				err = -ENOMEM;
-				goto clean_up;
+				goto unlock;
 			}
 		}
 #endif
+		mutex_unlock(&sd->devnode_lock);
 	}
 	return 0;
 
-clean_up:
+unlock:
+	mutex_unlock(&sd->devnode_lock);
 	list_for_each_entry(sd, &v4l2_dev->subdevs, list) {
-		if (!sd->devnode)
-			break;
-		video_unregister_device(sd->devnode);
+		mutex_lock(&sd->devnode_lock);
+		if (sd->devnode)
+			video_unregister_device(sd->devnode);
+		mutex_unlock(&sd->devnode_lock);
 	}
 
 	return err;
@@ -263,32 +316,52 @@ EXPORT_SYMBOL_GPL(__v4l2_device_register_subdev_nodes);
 void v4l2_device_unregister_subdev(struct v4l2_subdev *sd)
 {
 	struct v4l2_device *v4l2_dev;
+	struct video_device *vdev;
 
-	/* return if it isn't registered */
-	if (sd == NULL || sd->v4l2_dev == NULL)
+	if (!sd)
 		return;
 
+	mutex_lock(&sd->devnode_lock);
 	v4l2_dev = sd->v4l2_dev;
+	if (!v4l2_dev || sd->unregistering) {
+		mutex_unlock(&sd->devnode_lock);
+		return;
+	}
+
+	/*
+	 * Quiesce open/ioctl before callbacks or media graph removal. The
+	 * registration hold keeps vdev and sd alive across node withdrawal.
+	 */
+	sd->unregistering = true;
+	vdev = sd->devnode;
+	if (vdev)
+		video_unregister_device(vdev);
+	mutex_unlock(&sd->devnode_lock);
 
 	spin_lock(&v4l2_dev->lock);
 	list_del(&sd->list);
 	spin_unlock(&v4l2_dev->lock);
 
+	/* Callbacks may unregister other subdevs; never hold devnode_lock here. */
 	if (sd->internal_ops && sd->internal_ops->unregistered)
 		sd->internal_ops->unregistered(sd);
+
+	mutex_lock(&sd->devnode_lock);
 	sd->v4l2_dev = NULL;
+	mutex_unlock(&sd->devnode_lock);
 
 #if defined(CONFIG_MEDIA_CONTROLLER)
 	if (v4l2_dev->mdev) {
 		/*
-		 * No need to explicitly remove links, as both pads and
-		 * links are removed by the function below, in the right order
+		 * Both pads and links are removed in the right order by the
+		 * media core. File operations can no longer enter this graph.
 		 */
 		media_device_unregister_entity(&sd->entity);
 	}
 #endif
-	if (sd->devnode)
-		video_unregister_device(sd->devnode);
+	if (vdev)
+		/* Final put may free sd and vdev. */
+		put_device(&vdev->dev);
 	else
 		v4l2_subdev_release(sd);
 }

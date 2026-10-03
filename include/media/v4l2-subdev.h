@@ -8,6 +8,8 @@
 #ifndef _V4L2_SUBDEV_H
 #define _V4L2_SUBDEV_H
 
+#include <linux/kref.h>
+#include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/v4l2-subdev.h>
 #include <media/media-entity.h>
@@ -1016,6 +1018,9 @@ struct v4l2_subdev_platform_data {
  * @host_priv: pointer to private data used by the device where the subdev
  *	is attached.
  * @devnode: subdev device node
+ * @devnode_lock: serializes devnode publication, withdrawal and file operations
+ * @unregistering: devnode admission has been closed for subdev unregistration
+ * @framework_ref: holds framework registration through bridge teardown callbacks
  * @dev: pointer to the physical device, if any
  * @fwnode: The fwnode_handle of the subdev, usually the same as
  *	    either dev->of_node->fwnode or dev->fwnode (whichever is non-NULL).
@@ -1064,6 +1069,10 @@ struct v4l2_subdev {
 	void *dev_priv;
 	void *host_priv;
 	struct video_device *devnode;
+	/* Protect devnode publication/withdrawal against file operations. */
+	struct mutex devnode_lock;
+	struct kref framework_ref;
+	bool unregistering;
 	struct device *dev;
 	struct fwnode_handle *fwnode;
 	struct list_head async_list;

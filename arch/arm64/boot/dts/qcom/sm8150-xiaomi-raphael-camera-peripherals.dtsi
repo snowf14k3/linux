@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 /*
  * Raphael camera peripherals from the public CamX module data.
- * Include after sm8150-xiaomi-raphael-camera.dtsi; all new I2C clients stay
- * disabled until the camera rails and module combinations are verified.
+ * Include after sm8150-xiaomi-raphael-camera.dtsi. Enabled module combinations
+ * still require hardware validation.
  * EEPROM nodes expose raw bytes only. No calibration layout is assumed.
  * The EEPROM part numbers are not assumed; the read-only provider handles
  * their CamX 16-bit-offset protocol and downstream VIO/VAF/MCLK sequencing.
@@ -19,7 +19,7 @@
 			reg = <0x0c>;
 			vin-supply = <&camera_vio>;
 			vdd-supply = <&camera_main_vaf>;
-			status = "disabled";
+			status = "okay";
 		};
 
 		/* CamX: 0xb0 write address, 16-bit offset, 8192-byte read span. */
@@ -34,7 +34,7 @@
 			assigned-clocks = <&camcc CAM_CC_MCLK0_CLK_SRC>;
 			assigned-clock-rates = <19200000>;
 			read-only;
-			status = "disabled";
+			status = "okay";
 		};
 
 		/* CamX: 0xa8 write address, GT24P64, 8040-byte read span. */
@@ -48,7 +48,7 @@
 			assigned-clocks = <&camcc CAM_CC_MCLK2_CLK_SRC>;
 			assigned-clock-rates = <19200000>;
 			read-only;
-			status = "disabled";
+			status = "okay";
 		};
 	};
 
@@ -58,7 +58,7 @@
 			reg = <0x0e>;
 			vin-supply = <&camera_vio>;
 			vdd-supply = <&camera_tele_vaf>;
-			status = "disabled";
+			status = "okay";
 		};
 
 		/* CamX: 0xa0 write address, 16-bit offset, 7158-byte read span. */
@@ -73,7 +73,7 @@
 			assigned-clocks = <&camcc CAM_CC_MCLK1_CLK_SRC>;
 			assigned-clock-rates = <19200000>;
 			read-only;
-			status = "disabled";
+			status = "okay";
 		};
 	};
 };
@@ -91,7 +91,7 @@
 			assigned-clocks = <&camcc CAM_CC_MCLK3_CLK_SRC>;
 			assigned-clock-rates = <19200000>;
 			read-only;
-			status = "disabled";
+			status = "okay";
 		};
 	};
 };

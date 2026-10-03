@@ -9,6 +9,7 @@
 #include <linux/completion.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/of.h>
 #include <media/mipi-csi2.h>
@@ -90,6 +91,7 @@
 #define CSID_IPP_PIX_DROP_PERIOD	0x228
 #define CSID_IPP_LINE_DROP_PATTERN	0x22C
 #define CSID_IPP_LINE_DROP_PERIOD	0x230
+#define CSID_IPP_STATUS			0x254
 
 #define CSID_RDI_CFG0(rdi)			((csid_is_lite(csid) ? 0x200 : 0x300) \
 						 + 0x100 * (rdi))
@@ -143,6 +145,8 @@
 							+ 0x100 * (rdi))
 #define CSID_RDI_RPP_LINE_DROP_PERIOD(rdi)		((csid_is_lite(csid) ? 0x230 : 0x330)\
 							+ 0x100 * (rdi))
+#define CSID_RDI_STATUS(rdi)		((csid_is_lite(csid) ? 0x250 : 0x350) \
+					 + 0x100 * (rdi))
 
 #define CSID_TPG_CTRL		0x600
 #define		TPG_CTRL_TEST_EN		0
@@ -472,6 +476,48 @@ static void csid_configure_stream(struct csid_device *csid, u8 enable)
 	}
 }
 
+static int csid_stop_stream(struct csid_device *csid)
+{
+	bool has_ipp = csid_has_ipp(csid);
+	unsigned int i;
+	u32 status_reg, cfg_reg, val;
+	int ret = 0, rc;
+
+	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS; i++) {
+		if (!(csid->phy.en_vc & BIT(i)))
+			continue;
+
+		if (has_ipp && i == CSID_8150_IPP_PATH) {
+			writel_relaxed(0, csid->base + CSID_CSI2_IPP_IRQ_MASK);
+			__csid_ctrl_ipp(csid, 0);
+			status_reg = CSID_IPP_STATUS;
+			cfg_reg = CSID_IPP_CFG0;
+		} else {
+			writel_relaxed(0, csid->base + CSID_CSI2_RDIN_IRQ_MASK(i));
+			__csid_ctrl_rdi(csid, 0, i);
+			status_reg = CSID_RDI_STATUS(i);
+			cfg_reg = CSID_RDI_CFG0(i);
+		}
+
+		/* CSID175/Lite17x report the halted state in STATUS bit 0. */
+		rc = readl_poll_timeout(csid->base + status_reg, val, val & BIT(0),
+					1000, 100000);
+		if (rc) {
+			dev_err(csid->camss->dev, "CSID%u path%u halt timeout\n",
+				csid->id, i);
+			ret = rc;
+		}
+		writel_relaxed(0, csid->base + cfg_reg);
+
+		if (csid->testgen.enabled)
+			__csid_configure_testgen(csid, 0,
+				has_ipp && i == CSID_8150_IPP_PATH ? 0 : i,
+				MSM_CSID_PAD_FIRST_SRC + i);
+	}
+
+	return ret;
+}
+
 static int csid_configure_testgen_pattern(struct csid_device *csid, s32 val)
 {
 	if (val > 0 && val <= csid->testgen.nmodes)
@@ -563,6 +609,7 @@ static void csid_subdev_init(struct csid_device *csid)
 
 const struct csid_hw_ops csid_ops_gen2 = {
 	.configure_stream = csid_configure_stream,
+	.stop_stream = csid_stop_stream,
 	.validate_stream = csid_validate_stream,
 	.configure_testgen_pattern = csid_configure_testgen_pattern,
 	.hw_version = csid_hw_version,

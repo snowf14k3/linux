@@ -26,6 +26,17 @@ allOf:
       properties:
         custom1-supply: false
 
+  - if:
+      properties:
+        compatible:
+          const: samsung,s5k3t2
+    then:
+      required:
+        - popup-motor
+    else:
+      properties:
+        popup-motor: false
+
 properties:
   compatible:
     enum:
@@ -43,6 +54,11 @@ properties:
   clock-names:
     const: xvclk
 
+  aux-supply:
+    description:
+      Shared 3.1 V module support rail from PM8150 L17. CamX calls this
+      CUSTOM_REG2 for IMX586 and CUSTOM_REG1 for the other modules.
+
   avdd-supply:
     description: Analog supply.
 
@@ -57,6 +73,14 @@ properties:
 
   reset-gpios:
     maxItems: 1
+    description: Active-low sensor reset input.
+
+  popup-motor:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Calibrated popup interlock for the S5K3T2 front module. Opening its
+      subdevice, including inspection-only opens, holds the camera extended.
+      Streaming also holds the interlock until the sensor has stopped.
 
   flash-leds: true
   lens-focus: true
@@ -86,6 +110,7 @@ required:
   - compatible
   - reg
   - clocks
+  - aux-supply
   - avdd-supply
   - dvdd-supply
   - dovdd-supply

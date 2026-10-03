@@ -307,11 +307,8 @@ static void vfe_wm_start(struct vfe_device *vfe, u8 wm, struct vfe_line *line)
 
 	writel_relaxed(0x0, vfe->base + VFE_BUS_WM_TEST_BUS_CTRL);
 
+	/* Ordinary comp0 completion does not use dual-IFE address sync. */
 	val = WM_ADDR_NO_SYNC_DEFAULT_VAL;
-	if (vfe->camss->res->version == CAMSS_8150 && !vfe_is_lite(vfe) &&
-	    vfe->wm_output_map[VFE175_WM_PIX_Y] == VFE_LINE_PIX &&
-	    vfe->wm_output_map[VFE175_WM_PIX_C] == VFE_LINE_PIX)
-		val &= ~VFE175_PIX_COMP_MASK;
 	writel_relaxed(val, vfe->base + VFE_BUS_WM_ADDR_SYNC_NO_SYNC);
 	if (is_pix)
 		writel_relaxed(VFE175_PIX_COMP_MASK,
@@ -348,13 +345,8 @@ static void vfe_wm_stop(struct vfe_device *vfe, u8 wm)
 	/* Disable WM */
 	writel_relaxed(0, vfe->base + VFE_BUS_WM_CFG(wm));
 	if (wm == VFE175_WM_PIX_C &&
-	    vfe_is_sm8150_pix(vfe, vfe->wm_output_map[wm])) {
+	    vfe_is_sm8150_pix(vfe, vfe->wm_output_map[wm]))
 		writel_relaxed(0, vfe->base + VFE_BUS_COMP_GRP0_MASK);
-		writel_relaxed(readl_relaxed(vfe->base +
-					   VFE_BUS_WM_ADDR_SYNC_NO_SYNC) |
-			       VFE175_PIX_COMP_MASK,
-			       vfe->base + VFE_BUS_WM_ADDR_SYNC_NO_SYNC);
-	}
 }
 
 static void vfe_wm_update(struct vfe_device *vfe, u8 wm, u32 addr,
@@ -441,6 +433,20 @@ static void vfe_violation_read(struct vfe_device *vfe)
 	pr_err_ratelimited("VFE: violation = 0x%08x\n", violation);
 }
 
+static void vfe_output_error(struct vfe_device *vfe, enum vfe_line_id line_id)
+{
+	struct vfe_line *line = &vfe->line[line_id];
+	unsigned long flags;
+
+	spin_lock_irqsave(&vfe->output_lock, flags);
+	if (line->output.state == VFE_OUTPUT_ON) {
+		/* Keep DMA buffers owned until STREAMOFF stops the hardware. */
+		line->output.state = VFE_OUTPUT_STOPPING;
+		vb2_queue_error(&line->video_out.vb2_q);
+	}
+	spin_unlock_irqrestore(&vfe->output_lock, flags);
+}
+
 /*
  * vfe_isr - VFE module interrupt handler
  * @irq: Interrupt line
@@ -489,7 +495,18 @@ static irqreturn_t vfe_isr(int irq, void *dev)
 		dev_err_ratelimited(vfe->camss->dev,
 				    "SM8150 PIX error: core=0x%08x bus=0x%08x\n",
 				    status1, vfe_bus_status[0]);
-		vb2_queue_error(&vfe->line[VFE_LINE_PIX].video_out.vb2_q);
+		vfe_output_error(vfe, VFE_LINE_PIX);
+	}
+	if (vfe->camss->res->version == CAMSS_8150 &&
+	    (vfe_bus_status[0] & (STATUS0_COMP_ERROR |
+				 STATUS0_COMP_OVERWRITE |
+				 STATUS0_OVERFLOW | STATUS0_VIOLATION))) {
+		/* The shared bus error does not identify a safe RDI client. */
+		dev_err_ratelimited(vfe->camss->dev,
+				    "SM8150 DMA error: bus=0x%08x\n",
+				    vfe_bus_status[0]);
+		for (i = VFE_LINE_RDI0; i < vfe->res->line_num; i++)
+			vfe_output_error(vfe, i);
 	}
 
 	for (i = VFE_LINE_RDI0; i < vfe->res->line_num; i++)
@@ -525,7 +542,11 @@ static irqreturn_t vfe_isr(int irq, void *dev)
  */
 static int vfe_halt(struct vfe_device *vfe)
 {
-	/* rely on vfe_disable_output() to stop the VFE */
+	if (vfe->camss->res->version == CAMSS_8150)
+		/* SM8150 teardown uses the bounded global-reset acknowledgment. */
+		return vfe_reset(vfe);
+
+	/* Other VFE17x platforms retain their existing WM-stop teardown. */
 	return 0;
 }
 
@@ -837,6 +858,12 @@ static int vfe_enable(struct vfe_line *line)
 		return -EIO;
 	}
 
+	/* Stopping a SM8150 WM has no drain acknowledgment; reset is VFE-wide. */
+	if (vfe->camss->res->version == CAMSS_8150 && vfe->stream_count) {
+		mutex_unlock(&vfe->stream_lock);
+		return -EBUSY;
+	}
+
 	if (!vfe->stream_count)
 		vfe_enable_irq_common(vfe);
 
@@ -888,6 +915,11 @@ error_get_output:
 static int vfe_disable_17x(struct vfe_line *line)
 {
 	struct vfe_device *vfe = to_vfe(line);
+	unsigned long flags;
+
+	spin_lock_irqsave(&vfe->output_lock, flags);
+	line->output.state = VFE_OUTPUT_STOPPING;
+	spin_unlock_irqrestore(&vfe->output_lock, flags);
 
 	if (vfe_is_sm8150_pix(vfe, line->id))
 		vfe_pix_stop_camif(vfe);
@@ -951,6 +983,9 @@ static void vfe_isr_wm_done(struct vfe_device *vfe, u8 wm)
 	}
 	line = &vfe->line[vfe->wm_output_map[wm]];
 	output = &line->output;
+
+	if (output->state != VFE_OUTPUT_ON)
+		goto out_unlock;
 
 	ready_buf = output->buf[0];
 	if (!ready_buf) {

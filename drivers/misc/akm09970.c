@@ -4,9 +4,11 @@
  *
  * Preserve the downstream /dev/akm09970 ioctl payload while using the
  * current GPIO, regulator and I2C interfaces. Position thresholds are
- * mechanism-specific and are interpreted by userspace from raw samples.
+ * mechanism-specific. Kernel consumers pin acquisition while moving; only
+ * fresh, validated samples are exposed to the position controller.
  */
 
+#include <linux/akm09970.h>
 #include <linux/compat.h>
 #include <linux/delay.h>
 #include <linux/err.h>
@@ -47,11 +49,15 @@ struct akm09970 {
 	u32 sample_sequence;
 	u32 measure_hz;
 	bool sample_valid;
+	unsigned int kernel_users;
+	bool user_active;
 	bool active;
 	bool resume_active;
 	bool suspended;
 	bool removing;
 };
+
+static struct i2c_driver akm09970_driver;
 
 static void akm09970_release_ref(struct kref *ref)
 {
@@ -87,6 +93,7 @@ static unsigned int akm09970_initial_sample_delay_ms(u32 hz)
 static void akm09970_invalidate_sample_locked(struct akm09970 *sensor,
 					       bool error)
 {
+	memset(sensor->sample, 0, sizeof(sensor->sample));
 	sensor->sample_valid = false;
 	sensor->sample_timestamp_ns = 0;
 	atomic_set(&sensor->data_ready, 0);
@@ -242,7 +249,7 @@ static int akm09970_open(struct inode *inode, struct file *file)
 	return nonseekable_open(inode, file);
 }
 
-static int akm09970_release(struct inode *inode, struct file *file)
+static int akm09970_file_release(struct inode *inode, struct file *file)
 {
 	struct akm09970 *sensor = file->private_data;
 
@@ -264,6 +271,120 @@ static __poll_t akm09970_poll(struct file *file, poll_table *wait)
 
 	return 0;
 }
+
+/* Caller holds lock. Three measurement periods bound cache freshness. */
+static int akm09970_snapshot_locked(struct akm09970 *sensor,
+				   struct akm09970_sample_snapshot *snapshot)
+{
+	if (sensor->removing)
+		return -ENODEV;
+	if (sensor->suspended || !sensor->active)
+		return -EBUSY;
+	if (!sensor->sample_valid)
+		return atomic_read(&sensor->sample_error) ? -EIO : -ENODATA;
+	if (ktime_get_boottime_ns() - sensor->sample_timestamp_ns >
+	    3ULL * NSEC_PER_SEC / sensor->measure_hz)
+		return -ESTALE;
+
+	memset(snapshot, 0, sizeof(*snapshot));
+	snapshot->timestamp_ns = sensor->sample_timestamp_ns;
+	snapshot->sequence = sensor->sample_sequence;
+	memcpy(snapshot->data, sensor->sample, sizeof(snapshot->data));
+	return 0;
+}
+
+struct akm09970 *akm09970_get(struct device *consumer, const char *property)
+{
+	struct device_node *np;
+	struct i2c_client *client;
+	struct akm09970 *sensor;
+	int ret = -EPROBE_DEFER;
+
+	np = of_parse_phandle(consumer->of_node, property, 0);
+	if (!np)
+		return ERR_PTR(-ENODEV);
+	client = of_find_i2c_device_by_node(np);
+	of_node_put(np);
+	if (!client)
+		return ERR_PTR(-EPROBE_DEFER);
+
+	device_lock(&client->dev);
+	sensor = i2c_get_clientdata(client);
+	if (client->dev.driver != &akm09970_driver.driver || !sensor ||
+	    sensor->removing)
+		goto unlock;
+	if (!try_module_get(THIS_MODULE))
+		goto unlock;
+	if (!device_link_add(consumer, &client->dev,
+			     DL_FLAG_AUTOREMOVE_CONSUMER)) {
+		module_put(THIS_MODULE);
+		ret = -ENOMEM;
+		goto unlock;
+	}
+	kref_get(&sensor->ref);
+	device_unlock(&client->dev);
+	return sensor;
+unlock:
+	device_unlock(&client->dev);
+	put_device(&client->dev);
+	return ERR_PTR(ret);
+}
+EXPORT_SYMBOL_GPL(akm09970_get);
+
+void akm09970_put(struct akm09970 *sensor)
+{
+	put_device(&sensor->client->dev);
+	kref_put(&sensor->ref, akm09970_release_ref);
+	module_put(THIS_MODULE);
+}
+EXPORT_SYMBOL_GPL(akm09970_put);
+
+int akm09970_acquire(struct akm09970 *sensor)
+{
+	int ret;
+
+	mutex_lock(&sensor->lock);
+	if (sensor->removing)
+		ret = -ENODEV;
+	else if (sensor->suspended)
+		ret = -EBUSY;
+	else {
+		ret = akm09970_activate_locked(sensor);
+		if (!ret)
+			sensor->kernel_users++;
+	}
+	mutex_unlock(&sensor->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(akm09970_acquire);
+
+void akm09970_release(struct akm09970 *sensor)
+{
+	mutex_lock(&sensor->lock);
+	if (WARN_ON_ONCE(!sensor->kernel_users))
+		goto unlock;
+	sensor->kernel_users--;
+	if (!sensor->kernel_users && !sensor->user_active) {
+		sensor->resume_active = false;
+		if (!sensor->removing)
+			akm09970_deactivate_locked(sensor);
+	}
+unlock:
+	mutex_unlock(&sensor->lock);
+}
+EXPORT_SYMBOL_GPL(akm09970_release);
+
+int akm09970_snapshot(struct akm09970 *sensor,
+		     struct akm09970_sample_snapshot *snapshot)
+{
+	int ret;
+
+	mutex_lock(&sensor->lock);
+	ret = akm09970_snapshot_locked(sensor, snapshot);
+	mutex_unlock(&sensor->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(akm09970_snapshot);
 
 static long akm09970_ioctl(struct file *file, unsigned int cmd,
 			   unsigned long arg)
@@ -296,13 +417,23 @@ static long akm09970_ioctl(struct file *file, unsigned int cmd,
 			ret = -EBUSY;
 			break;
 		}
-		if (payload.sensor_state)
+		if (payload.sensor_state) {
 			ret = akm09970_activate_locked(sensor);
-		else
-			akm09970_deactivate_locked(sensor);
+			if (!ret)
+				sensor->user_active = true;
+		} else {
+			sensor->user_active = false;
+			if (!sensor->kernel_users)
+				akm09970_deactivate_locked(sensor);
+		}
 		break;
 	case AKM_IOC_SET_MODE:
-		if (sensor->suspended) {
+		if (payload.sensor_mode != 10 && payload.sensor_mode != 20 &&
+		    payload.sensor_mode != 50 && payload.sensor_mode != 100) {
+			ret = -EINVAL;
+			break;
+		}
+		if (sensor->suspended || sensor->kernel_users) {
 			ret = -EBUSY;
 			break;
 		}
@@ -324,19 +455,15 @@ static long akm09970_ioctl(struct file *file, unsigned int cmd,
 						sensor->measure_hz)));
 		break;
 	case AKM_IOC_GET_SENSEDATA:
+		ret = akm09970_snapshot_locked(sensor, &snapshot);
+		if (ret)
+			break;
 		payload.sensor_state = sensor->active;
 		payload.sensor_mode = sensor->measure_hz;
 		memcpy(payload.data, sensor->sample, sizeof(payload.data));
 		break;
 	case AKM_IOC_GET_SAMPLE_SNAPSHOT:
-		if (!sensor->active || !sensor->sample_valid) {
-			ret = atomic_read(&sensor->sample_error) ?
-				-EIO : -ENODATA;
-			break;
-		}
-		snapshot.timestamp_ns = sensor->sample_timestamp_ns;
-		snapshot.sequence = sensor->sample_sequence;
-		memcpy(snapshot.data, sensor->sample, sizeof(snapshot.data));
+		ret = akm09970_snapshot_locked(sensor, &snapshot);
 		break;
 	case AKM_IOC_GET_SENSSMR:
 		payload.sensor_smr = 0;
@@ -374,7 +501,7 @@ static long akm09970_compat_ioctl(struct file *file, unsigned int cmd,
 static const struct file_operations akm09970_fops = {
 	.owner = THIS_MODULE,
 	.open = akm09970_open,
-	.release = akm09970_release,
+	.release = akm09970_file_release,
 	.unlocked_ioctl = akm09970_ioctl,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl = akm09970_compat_ioctl,

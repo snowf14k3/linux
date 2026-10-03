@@ -3,15 +3,18 @@
  * V4L2 RAW10 image sensor support for Xiaomi Raphael camera modules.
  *
  * Register sequences and mode timing live in raphael-sensor-tables.c.
- * The camera elevator and Hall switch are independent devices; userspace
- * must extend the front camera before starting this sensor.
+ * Front subdev opens and capture streams hold a calibrated popup interlock.
+ * Probe and chip identification never move the camera.
  */
 
+#include <linux/atomic.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/drv8846.h>
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/kernel.h>
+#include <linux/kref.h>
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -37,11 +40,15 @@ struct raphael_sensor {
 	const struct raphael_sensor_variant *variant;
 	struct regmap *regmap;
 	struct clk *mclk;
+	struct regulator *aux;
 	struct regulator *avdd;
 	struct regulator *dvdd;
 	struct regulator *dovdd;
 	struct regulator *custom1;
 	struct gpio_desc *reset_gpio;
+	struct drv8846 *popup_motor;
+	struct kref ref;
+	atomic_t registered;
 
 	struct v4l2_subdev sd;
 	struct media_pad pad;
@@ -53,7 +60,13 @@ struct raphael_sensor {
 	struct v4l2_ctrl *vblank;
 	struct v4l2_ctrl *exposure;
 	const struct raphael_sensor_mode *mode;
+	unsigned int popup_users;
 	bool streaming;
+	bool stream_fault;
+	bool removed;
+	bool controls_initialized;
+	bool entity_initialized;
+	bool state_initialized;
 };
 
 static inline struct raphael_sensor *to_raphael_sensor(struct v4l2_subdev *sd)
@@ -87,13 +100,19 @@ static int raphael_sensor_power_on(struct device *dev)
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct raphael_sensor *sensor = to_raphael_sensor(sd);
 	bool custom1_on = false, dvdd_on = false, dovdd_on = false;
+	bool avdd_on = false;
 	bool mclk_on = false;
 	int ret;
 
-	ret = regulator_enable(sensor->avdd);
+	/* CamX CUSTOM_REG2 (IMX586) / CUSTOM_REG1 (others): PM8150 L17. */
+	ret = regulator_enable(sensor->aux);
 	if (ret)
 		return ret;
 	usleep_range(5000, 6000);
+	ret = regulator_enable(sensor->avdd);
+	if (ret)
+		goto rollback;
+	avdd_on = true;
 
 	if (sensor->custom1) {
 		/* IMX586: VANA, CUSTOM1, VDIG, VIO, MCLK, RESET. */
@@ -126,11 +145,8 @@ static int raphael_sensor_power_on(struct device *dev)
 		goto rollback;
 	mclk_on = true;
 
-	/* Match the downstream physical GPIO high -> low reset sequence. */
-	ret = gpiod_direction_output(sensor->reset_gpio, 1);
-	if (ret)
-		goto rollback;
 	usleep_range(10000, 11000);
+	/* Release reset (physical high) only after MCLK has settled. */
 	ret = gpiod_direction_output(sensor->reset_gpio, 0);
 	if (ret)
 		goto rollback;
@@ -139,8 +155,16 @@ static int raphael_sensor_power_on(struct device *dev)
 	return 0;
 
 rollback:
-	if (mclk_on)
+	gpiod_set_value_cansleep(sensor->reset_gpio, 1);
+	if (mclk_on) {
+		if (sensor->custom1)
+			usleep_range(2000, 3000);
+		else
+			usleep_range(1000, 2000);
 		clk_disable_unprepare(sensor->mclk);
+		if (!sensor->custom1)
+			usleep_range(1000, 2000);
+	}
 	if (sensor->custom1) {
 		if (dovdd_on)
 			regulator_disable(sensor->dovdd);
@@ -154,7 +178,11 @@ rollback:
 		if (dovdd_on)
 			regulator_disable(sensor->dovdd);
 	}
-	regulator_disable(sensor->avdd);
+	if (avdd_on) {
+		regulator_disable(sensor->avdd);
+		usleep_range(20000, 21000);
+	}
+	regulator_disable(sensor->aux);
 	return ret;
 }
 
@@ -162,12 +190,17 @@ static int raphael_sensor_power_off(struct device *dev)
 {
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct raphael_sensor *sensor = to_raphael_sensor(sd);
-	int ret = 0, err;
+	int ret, err;
 
+	/* Assert reset (physical low) before disabling MCLK or any rail. */
+	ret = gpiod_direction_output(sensor->reset_gpio, 1);
+	if (sensor->custom1)
+		usleep_range(2000, 3000);
+	else
+		usleep_range(1000, 2000);
 	clk_disable_unprepare(sensor->mclk);
 	if (sensor->custom1) {
-		/* IMX586 CamX sequence: MCLK, VIO, VDIG, CUSTOM1, VANA. */
-		usleep_range(2000, 3000);
+		/* IMX586: MCLK, VIO, VDIG, S5, VANA, L17. */
 		err = regulator_disable(sensor->dovdd);
 		if (!ret)
 			ret = err;
@@ -178,12 +211,11 @@ static int raphael_sensor_power_off(struct device *dev)
 		if (!ret)
 			ret = err;
 	} else {
-		/* Other modules: MCLK, VDIG, VIO, VANA. */
+		/* Other modules: MCLK, VDIG, VIO, VANA, L17. */
 		usleep_range(1000, 2000);
 		err = regulator_disable(sensor->dvdd);
 		if (!ret)
 			ret = err;
-		usleep_range(1000, 2000);
 		err = regulator_disable(sensor->dovdd);
 		if (!ret)
 			ret = err;
@@ -192,13 +224,33 @@ static int raphael_sensor_power_off(struct device *dev)
 	err = regulator_disable(sensor->avdd);
 	if (!ret)
 		ret = err;
+	usleep_range(20000, 21000);
+	err = regulator_disable(sensor->aux);
+	if (!ret)
+		ret = err;
 
 	return ret;
 }
 
-static DEFINE_RUNTIME_DEV_PM_OPS(raphael_sensor_pm_ops,
-				 raphael_sensor_power_off,
-				 raphael_sensor_power_on, NULL);
+static int raphael_sensor_suspend(struct device *dev)
+{
+	struct raphael_sensor *sensor = to_raphael_sensor(dev_get_drvdata(dev));
+	int ret;
+
+	mutex_lock(&sensor->mutex);
+	/* Do not suspend a live capture or invalidate an open popup session. */
+	if (sensor->streaming || sensor->stream_fault || sensor->popup_users)
+		ret = -EBUSY;
+	else
+		ret = pm_runtime_force_suspend(dev);
+	mutex_unlock(&sensor->mutex);
+	return ret;
+}
+
+static const struct dev_pm_ops raphael_sensor_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(raphael_sensor_suspend, pm_runtime_force_resume)
+	RUNTIME_PM_OPS(raphael_sensor_power_off, raphael_sensor_power_on, NULL)
+};
 
 static int raphael_sensor_set_ctrl(struct v4l2_ctrl *ctrl)
 {
@@ -206,6 +258,9 @@ static int raphael_sensor_set_ctrl(struct v4l2_ctrl *ctrl)
 		container_of(ctrl->handler, struct raphael_sensor, ctrls);
 	const struct raphael_sensor_variant *variant = sensor->variant;
 	int ret;
+
+	if (sensor->removed)
+		return -ENODEV;
 
 	if (ctrl->id == V4L2_CID_VBLANK) {
 		u32 max = sensor->mode->height + ctrl->val -
@@ -429,7 +484,8 @@ static int raphael_sensor_set_fmt(struct v4l2_subdev *sd,
 	u64 best_distance = U64_MAX;
 	unsigned int i;
 
-	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE && sensor->streaming)
+	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE &&
+	    (sensor->streaming || sensor->stream_fault))
 		return -EBUSY;
 
 	for (i = 0; i < sensor->variant->num_modes; i++) {
@@ -489,7 +545,7 @@ static int raphael_sensor_set_interval(
 
 	if (fival->which != V4L2_SUBDEV_FORMAT_ACTIVE ||
 	    !fival->interval.numerator || !fival->interval.denominator ||
-	    sensor->streaming)
+	    sensor->streaming || sensor->stream_fault)
 		return -EINVAL;
 
 	requested = div_u64((u64)fival->interval.denominator * 100,
@@ -551,34 +607,131 @@ static int raphael_sensor_start_streaming(struct raphael_sensor *sensor)
 	return raphael_write_list(sensor, &variant->stream_on);
 }
 
+/* All popup and stream ownership is serialized by the subdev state lock. */
+static int raphael_sensor_popup_get(struct raphael_sensor *sensor)
+{
+	int ret;
+
+	if (!sensor->popup_motor)
+		return 0;
+	if (!sensor->popup_users) {
+		ret = drv8846_camera_open(sensor->popup_motor);
+		if (ret)
+			return ret;
+	}
+	sensor->popup_users++;
+	return 0;
+}
+
+static int raphael_sensor_popup_put(struct raphael_sensor *sensor)
+{
+	int ret;
+
+	if (!sensor->popup_motor || !sensor->popup_users)
+		return 0;
+	if (--sensor->popup_users)
+		return 0;
+
+	/* The motor consumes ownership even if the checked retraction fails. */
+	ret = drv8846_camera_close(sensor->popup_motor);
+	if (ret)
+		dev_err(sensor->dev, "popup retraction failed: %d\n", ret);
+	return ret;
+}
+
+static int raphael_sensor_open(struct v4l2_subdev *sd,
+			      struct v4l2_subdev_fh *fh)
+{
+	struct raphael_sensor *sensor = to_raphael_sensor(sd);
+	int ret;
+
+	/* Even an inspection/TRY-only open holds the front camera extended. */
+	mutex_lock(&sensor->mutex);
+	ret = sensor->removed ? -ENODEV : raphael_sensor_popup_get(sensor);
+	mutex_unlock(&sensor->mutex);
+	return ret;
+}
+
+static int raphael_sensor_close(struct v4l2_subdev *sd,
+			       struct v4l2_subdev_fh *fh)
+{
+	struct raphael_sensor *sensor = to_raphael_sensor(sd);
+	int ret = 0;
+
+	mutex_lock(&sensor->mutex);
+	if (!sensor->removed)
+		ret = raphael_sensor_popup_put(sensor);
+	mutex_unlock(&sensor->mutex);
+	return ret;
+}
+
 static int raphael_sensor_set_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct raphael_sensor *sensor = to_raphael_sensor(sd);
 	struct v4l2_subdev_state *state;
-	int ret = 0;
+	int ret = 0, err;
 
 	state = v4l2_subdev_lock_and_get_active_state(sd);
-	if (sensor->streaming == !!enable)
+	if (sensor->removed) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	if (enable && sensor->stream_fault) {
+		/* Failed STREAMON may never receive STREAMOFF from the bridge. */
+		ret = raphael_write_list(sensor, &sensor->variant->stream_off);
+		if (ret)
+			goto unlock;
+		sensor->streaming = false;
+		sensor->stream_fault = false;
+		pm_runtime_put(sensor->dev);
+		ret = raphael_sensor_popup_put(sensor);
+		if (ret)
+			goto unlock;
+	}
+	if (!sensor->stream_fault && sensor->streaming == !!enable)
 		goto unlock;
 
 	if (enable) {
+		/* Capture through a video node need not open the sensor devnode. */
+		ret = raphael_sensor_popup_get(sensor);
+		if (ret)
+			goto unlock;
+		if (sensor->popup_motor) {
+			ret = drv8846_camera_ready(sensor->popup_motor);
+			if (ret)
+				goto put_popup;
+		}
 		ret = pm_runtime_resume_and_get(sensor->dev);
 		if (ret < 0)
-			goto unlock;
+			goto put_popup;
 		ret = raphael_sensor_start_streaming(sensor);
 		if (ret) {
-			/* A multi-write start sequence may have enabled the sensor. */
-			raphael_write_list(sensor, &sensor->variant->stream_off);
+			/* A partial start may already have enabled the sensor. */
+			err = raphael_write_list(sensor, &sensor->variant->stream_off);
+			if (err) {
+				sensor->stream_fault = true;
+				dev_err(sensor->dev, "failed to stop partial stream: %d\n", err);
+				goto unlock;
+			}
 			pm_runtime_put(sensor->dev);
-			goto unlock;
+			goto put_popup;
 		}
 		sensor->streaming = true;
 	} else {
 		ret = raphael_write_list(sensor, &sensor->variant->stream_off);
+		if (ret) {
+			sensor->stream_fault = true;
+			goto unlock;
+		}
 		sensor->streaming = false;
+		sensor->stream_fault = false;
 		pm_runtime_put(sensor->dev);
+		ret = raphael_sensor_popup_put(sensor);
 	}
+	goto unlock;
 
+put_popup:
+	raphael_sensor_popup_put(sensor);
 unlock:
 	v4l2_subdev_unlock_state(state);
 	return ret;
@@ -613,8 +766,46 @@ static const struct media_entity_operations raphael_sensor_entity_ops = {
 	.link_validate = v4l2_subdev_link_validate,
 };
 
+static void raphael_sensor_free(struct kref *ref)
+{
+	struct raphael_sensor *sensor = container_of(ref, struct raphael_sensor, ref);
+
+	if (sensor->state_initialized)
+		v4l2_subdev_cleanup(&sensor->sd);
+	if (sensor->entity_initialized)
+		media_entity_cleanup(&sensor->sd.entity);
+	if (sensor->controls_initialized)
+		v4l2_ctrl_handler_free(&sensor->ctrls);
+	mutex_destroy(&sensor->mutex);
+	kfree(sensor);
+}
+
+static int raphael_sensor_registered(struct v4l2_subdev *sd)
+{
+	struct raphael_sensor *sensor = to_raphael_sensor(sd);
+
+	/* Do not overlap a new registration with an old open devnode. */
+	if (atomic_cmpxchg(&sensor->registered, 0, 1))
+		return -EBUSY;
+	kref_get(&sensor->ref);
+	return 0;
+}
+
+static void raphael_sensor_release(struct v4l2_subdev *sd)
+{
+	struct raphael_sensor *sensor = to_raphael_sensor(sd);
+
+	/* Consume each registration reference only once. */
+	if (atomic_xchg(&sensor->registered, 0))
+		kref_put(&sensor->ref, raphael_sensor_free);
+}
+
 static const struct v4l2_subdev_internal_ops raphael_sensor_internal_ops = {
 	.init_state = raphael_sensor_init_state,
+	.registered = raphael_sensor_registered,
+	.open = raphael_sensor_open,
+	.close = raphael_sensor_close,
+	.release = raphael_sensor_release,
 };
 
 static int raphael_sensor_check_endpoint(struct raphael_sensor *sensor)
@@ -657,6 +848,34 @@ out:
 	return ret;
 }
 
+/* Also used after an async-registration failure exposed a device node. */
+static void raphael_sensor_shutdown(struct raphael_sensor *sensor)
+{
+	mutex_lock(&sensor->mutex);
+	sensor->removed = true;
+	mutex_unlock(&sensor->mutex);
+	v4l2_async_unregister_subdev(&sensor->sd);
+	pm_runtime_disable(sensor->dev);
+	if (sensor->streaming || sensor->stream_fault) {
+		pm_runtime_put_noidle(sensor->dev);
+		sensor->streaming = false;
+		sensor->stream_fault = false;
+	}
+	if (!pm_runtime_status_suspended(sensor->dev)) {
+		if (raphael_sensor_power_off(sensor->dev))
+			dev_err(sensor->dev, "failed to power down sensor during teardown\n");
+		pm_runtime_set_suspended(sensor->dev);
+	}
+	/* Removal never retracts around uncertain sensor or actuator state. */
+	if (sensor->popup_motor) {
+		if (sensor->popup_users)
+			drv8846_camera_abort(sensor->popup_motor);
+		drv8846_put(sensor->popup_motor);
+		sensor->popup_motor = NULL;
+		sensor->popup_users = 0;
+	}
+}
+
 static int raphael_sensor_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -669,10 +888,11 @@ static int raphael_sensor_probe(struct i2c_client *client)
 	if (!variant)
 		return -ENODEV;
 
-	sensor = devm_kzalloc(dev, sizeof(*sensor), GFP_KERNEL);
+	sensor = kzalloc_obj(*sensor);
 	if (!sensor)
 		return -ENOMEM;
 
+	kref_init(&sensor->ref);
 	sensor->dev = dev;
 	sensor->variant = variant;
 	sensor->mode = &variant->modes[0];
@@ -683,55 +903,70 @@ static int raphael_sensor_probe(struct i2c_client *client)
 	sensor->regmap = devm_cci_regmap_init_i2c(client, 16);
 	if (IS_ERR(sensor->regmap)) {
 		ret = PTR_ERR(sensor->regmap);
-		goto destroy_mutex;
+		goto put_sensor;
 	}
 
 	sensor->mclk = devm_v4l2_sensor_clk_get(dev, NULL);
 	if (IS_ERR(sensor->mclk)) {
 		ret = PTR_ERR(sensor->mclk);
-		goto destroy_mutex;
+		goto put_sensor;
 	}
 	if (clk_get_rate(sensor->mclk) != RAPHAEL_SENSOR_MCLK_RATE) {
 		ret = -EINVAL;
-		goto destroy_mutex;
+		goto put_sensor;
 	}
 
+	sensor->aux = devm_regulator_get(dev, "aux");
+	if (IS_ERR(sensor->aux)) {
+		ret = PTR_ERR(sensor->aux);
+		goto put_sensor;
+	}
 	sensor->avdd = devm_regulator_get(dev, "avdd");
 	if (IS_ERR(sensor->avdd)) {
 		ret = PTR_ERR(sensor->avdd);
-		goto destroy_mutex;
+		goto put_sensor;
 	}
 	sensor->dvdd = devm_regulator_get(dev, "dvdd");
 	if (IS_ERR(sensor->dvdd)) {
 		ret = PTR_ERR(sensor->dvdd);
-		goto destroy_mutex;
+		goto put_sensor;
 	}
 	sensor->dovdd = devm_regulator_get(dev, "dovdd");
 	if (IS_ERR(sensor->dovdd)) {
 		ret = PTR_ERR(sensor->dovdd);
-		goto destroy_mutex;
+		goto put_sensor;
 	}
 	if (variant->custom1_supply) {
 		sensor->custom1 = devm_regulator_get(dev, "custom1");
 		if (IS_ERR(sensor->custom1)) {
 			ret = PTR_ERR(sensor->custom1);
-			goto destroy_mutex;
+			goto put_sensor;
 		}
 	}
 
-	sensor->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
+	sensor->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(sensor->reset_gpio)) {
 		ret = PTR_ERR(sensor->reset_gpio);
-		goto destroy_mutex;
+		goto put_sensor;
+	}
+
+	if (variant == &raphael_s5k3t2) {
+		sensor->popup_motor = drv8846_get(dev, "popup-motor");
+		if (IS_ERR(sensor->popup_motor)) {
+			ret = dev_err_probe(dev, PTR_ERR(sensor->popup_motor),
+					    "failed to get popup interlock\n");
+			sensor->popup_motor = NULL;
+			goto put_sensor;
+		}
 	}
 
 	ret = raphael_sensor_check_endpoint(sensor);
 	if (ret)
-		goto destroy_mutex;
+		goto put_sensor;
 
 	ret = raphael_sensor_power_on(dev);
 	if (ret)
-		goto destroy_mutex;
+		goto put_sensor;
 
 	ret = cci_read(sensor->regmap, CCI_REG16(variant->chip_id_register),
 		       &chip_id, NULL);
@@ -747,6 +982,7 @@ static int raphael_sensor_probe(struct i2c_client *client)
 	ret = raphael_sensor_init_controls(sensor);
 	if (ret)
 		goto power_off;
+	sensor->controls_initialized = true;
 
 	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
 	sensor->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
@@ -755,12 +991,14 @@ static int raphael_sensor_probe(struct i2c_client *client)
 	sensor->sd.entity.ops = &raphael_sensor_entity_ops;
 	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
 	if (ret)
-		goto free_controls;
+		goto power_off;
+	sensor->entity_initialized = true;
 
 	sensor->sd.state_lock = &sensor->mutex;
 	ret = v4l2_subdev_init_finalize(&sensor->sd);
 	if (ret)
-		goto free_entity;
+		goto power_off;
+	sensor->state_initialized = true;
 
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
@@ -772,17 +1010,15 @@ static int raphael_sensor_probe(struct i2c_client *client)
 	return 0;
 
 cleanup_subdev:
-	pm_runtime_disable(dev);
-	pm_runtime_set_suspended(dev);
-	v4l2_subdev_cleanup(&sensor->sd);
-free_entity:
-	media_entity_cleanup(&sensor->sd.entity);
-free_controls:
-	v4l2_ctrl_handler_free(&sensor->ctrls);
+	raphael_sensor_shutdown(sensor);
+	kref_put(&sensor->ref, raphael_sensor_free);
+	return ret;
 power_off:
 	raphael_sensor_power_off(dev);
-destroy_mutex:
-	mutex_destroy(&sensor->mutex);
+put_sensor:
+	if (sensor->popup_motor)
+		drv8846_put(sensor->popup_motor);
+	kref_put(&sensor->ref, raphael_sensor_free);
 	return ret;
 }
 
@@ -791,16 +1027,9 @@ static void raphael_sensor_remove(struct i2c_client *client)
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct raphael_sensor *sensor = to_raphael_sensor(sd);
 
-	v4l2_async_unregister_subdev(sd);
-	v4l2_subdev_cleanup(sd);
-	media_entity_cleanup(&sd->entity);
-	v4l2_ctrl_handler_free(&sensor->ctrls);
-	pm_runtime_disable(sensor->dev);
-	if (!pm_runtime_status_suspended(sensor->dev)) {
-		raphael_sensor_power_off(sensor->dev);
-		pm_runtime_set_suspended(sensor->dev);
-	}
-	mutex_destroy(&sensor->mutex);
+	raphael_sensor_shutdown(sensor);
+	/* Open file handles retain the subdev, controls and state mutex. */
+	kref_put(&sensor->ref, raphael_sensor_free);
 }
 
 static const struct of_device_id raphael_sensor_of_match[] = {

@@ -162,6 +162,7 @@ struct vfe_device {
 	struct mutex stream_lock;
 	int stream_count;
 	bool reset_failed;
+	bool dma_quarantined;
 	spinlock_t output_lock;
 	enum vfe_line_id wm_output_map[MSM_VFE_IMAGE_MASTERS_NUM];
 	struct vfe_line line[VFE_LINE_NUM_MAX];

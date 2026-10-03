@@ -83,6 +83,9 @@ struct csid_hw_ops {
 	 */
 	void (*configure_stream)(struct csid_device *csid, u8 enable);
 
+	/* Halt an active stream and wait for the hardware to become idle. */
+	int (*stop_stream)(struct csid_device *csid);
+
 	/* Validate a pending stream before programming hardware. */
 	int (*validate_stream)(struct csid_device *csid);
 

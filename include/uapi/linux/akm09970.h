@@ -74,7 +74,9 @@ struct akm09970_platform_data {
 
 /* New samples use CLOCK_BOOTTIME; the sequence increases on each sample.
  * GET_SAMPLE_SNAPSHOT returns -ENODATA before a sample and -EIO after an
- * invalid active read. Neither error returns the cached sample.
+ * invalid active read. Inactive/suspended acquisition returns -EBUSY;
+ * samples older than three measurement periods return -ESTALE. Neither
+ * error returns cached data. These checks also apply to GET_SENSEDATA.
  */
 struct akm09970_sample_snapshot {
 	__u64 timestamp_ns;

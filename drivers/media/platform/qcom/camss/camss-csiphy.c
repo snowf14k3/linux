@@ -509,6 +509,11 @@ static int csiphy_set_format(struct v4l2_subdev *sd,
 	struct csiphy_device *csiphy = v4l2_get_subdevdata(sd);
 	struct v4l2_mbus_framefmt *format;
 
+	if (csiphy->camss->res->version == CAMSS_8150 &&
+	    fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE &&
+	    media_entity_is_streaming(&sd->entity))
+		return -EBUSY;
+
 	format = __csiphy_get_format(csiphy, sd_state, fmt->pad, fmt->which);
 	if (format == NULL)
 		return -EINVAL;

@@ -16,6 +16,13 @@ description: |
   asleep and unpowered whenever idle.
 
 properties:
+  ti,hall-sensor:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      AK09970 sensor observing this exact motor mechanism. Required for
+      automatic movement and camera lifecycle control. Endpoint calibration
+      is provisioned by privileged userspace per assembled unit, not by DT.
+
   compatible:
     const: ti,drv8846
 

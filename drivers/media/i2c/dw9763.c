@@ -6,11 +6,14 @@
  * Position uses the same 10-bit DAC register pair as the DW9768 family.
  */
 
+#include <linux/atomic.h>
 #include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/i2c.h>
 #include <linux/kernel.h>
+#include <linux/kref.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
 
@@ -40,6 +43,13 @@ struct dw9763 {
 	struct v4l2_subdev sd;
 	struct v4l2_ctrl_handler controls;
 	struct v4l2_ctrl *focus;
+	struct kref ref;
+	atomic_t registered;
+	struct mutex pm_lock;
+	unsigned int open_users;
+	bool removed;
+	bool controls_initialized;
+	bool entity_initialized;
 };
 
 static struct dw9763 *to_dw9763(struct v4l2_subdev *sd)
@@ -64,14 +74,15 @@ static int dw9763_runtime_resume(struct device *dev)
 	if (ret)
 		goto disable_supplies;
 
+	cci_write(vcm->regmap, DW9763_REG_CONTROL, 0x00, &ret);
+	if (ret)
+		goto disable_supplies;
+	/* The module's delayUs belongs to the normal-mode write, not reset. */
 	usleep_range(1000, 1200);
 
-	cci_write(vcm->regmap, DW9763_REG_CONTROL, 0x00, &ret);
 	cci_write(vcm->regmap, DW9763_REG_CONTROL, 0x02, &ret);
 	cci_write(vcm->regmap, DW9763_REG_AAC_MODE, 0x60, &ret);
 	cci_write(vcm->regmap, DW9763_REG_AAC_TIME, 0x02, &ret);
-	cci_write(vcm->regmap, DW9763_REG_POSITION,
-		  READ_ONCE(vcm->focus->val), &ret);
 	if (!ret)
 		return 0;
 
@@ -101,6 +112,9 @@ static int dw9763_set_ctrl(struct v4l2_ctrl *ctrl)
 	int active;
 	int ret;
 
+	if (READ_ONCE(vcm->removed))
+		return -ENODEV;
+
 	if (ctrl->id != V4L2_CID_FOCUS_ABSOLUTE)
 		return -EINVAL;
 
@@ -126,21 +140,103 @@ static const struct v4l2_ctrl_ops dw9763_ctrl_ops = {
 
 static int dw9763_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 {
-	return pm_runtime_resume_and_get(sd->dev);
+	struct dw9763 *vcm = to_dw9763(sd);
+	int ret;
+
+	mutex_lock(&vcm->pm_lock);
+	if (vcm->removed) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	ret = pm_runtime_resume_and_get(sd->dev);
+	if (ret < 0)
+		goto unlock;
+	/*
+	 * Restore only after PM marks the device active. A control cached
+	 * during resume would otherwise miss the final position write.
+	 */
+	ret = v4l2_ctrl_handler_setup(&vcm->controls);
+	if (ret)
+		pm_runtime_put(sd->dev);
+	else
+		vcm->open_users++;
+unlock:
+	mutex_unlock(&vcm->pm_lock);
+	return ret;
 }
 
 static int dw9763_close(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 {
-	pm_runtime_put_autosuspend(sd->dev);
+	struct dw9763 *vcm = to_dw9763(sd);
+
+	mutex_lock(&vcm->pm_lock);
+	if (!vcm->removed) {
+		vcm->open_users--;
+		pm_runtime_put_autosuspend(sd->dev);
+	}
+	mutex_unlock(&vcm->pm_lock);
 	return 0;
 }
 
+static void dw9763_free(struct kref *ref)
+{
+	struct dw9763 *vcm = container_of(ref, struct dw9763, ref);
+
+	if (vcm->entity_initialized)
+		media_entity_cleanup(&vcm->sd.entity);
+	if (vcm->controls_initialized)
+		v4l2_ctrl_handler_free(&vcm->controls);
+	mutex_destroy(&vcm->pm_lock);
+	kfree(vcm);
+}
+
+static int dw9763_registered(struct v4l2_subdev *sd)
+{
+	struct dw9763 *vcm = to_dw9763(sd);
+
+	/* Do not overlap a new registration with an old open devnode. */
+	if (atomic_cmpxchg(&vcm->registered, 0, 1))
+		return -EBUSY;
+	kref_get(&vcm->ref);
+	return 0;
+}
+
+static void dw9763_release(struct v4l2_subdev *sd)
+{
+	struct dw9763 *vcm = to_dw9763(sd);
+
+	/* Consume each registration reference only once. */
+	if (atomic_xchg(&vcm->registered, 0))
+		kref_put(&vcm->ref, dw9763_free);
+}
+
 static const struct v4l2_subdev_internal_ops dw9763_internal_ops = {
+	.registered = dw9763_registered,
 	.open = dw9763_open,
 	.close = dw9763_close,
+	.release = dw9763_release,
 };
 
 static const struct v4l2_subdev_ops dw9763_subdev_ops = {};
+
+/* Retained file handles must stop using devm resources on probe failure too. */
+static void dw9763_shutdown(struct dw9763 *vcm)
+{
+	mutex_lock(&vcm->pm_lock);
+	v4l2_ctrl_lock(vcm->focus);
+	WRITE_ONCE(vcm->removed, true);
+	v4l2_ctrl_unlock(vcm->focus);
+	mutex_unlock(&vcm->pm_lock);
+	v4l2_async_unregister_subdev(&vcm->sd);
+	pm_runtime_disable(vcm->dev);
+	while (vcm->open_users) {
+		pm_runtime_put_noidle(vcm->dev);
+		vcm->open_users--;
+	}
+	if (!IS_ENABLED(CONFIG_PM) || !pm_runtime_status_suspended(vcm->dev))
+		dw9763_runtime_suspend(vcm->dev);
+	pm_runtime_dont_use_autosuspend(vcm->dev);
+}
 
 static int dw9763_probe(struct i2c_client *client)
 {
@@ -148,33 +244,42 @@ static int dw9763_probe(struct i2c_client *client)
 	struct dw9763 *vcm;
 	int ret;
 
-	vcm = devm_kzalloc(dev, sizeof(*vcm), GFP_KERNEL);
+	vcm = kzalloc_obj(*vcm);
 	if (!vcm)
 		return -ENOMEM;
 
+	kref_init(&vcm->ref);
+	mutex_init(&vcm->pm_lock);
 	vcm->dev = dev;
 	vcm->supplies[DW9763_VIN].supply = "vin";
 	vcm->supplies[DW9763_VDD].supply = "vdd";
 
 	ret = devm_regulator_bulk_get(dev, DW9763_NUM_SUPPLIES,
 				      vcm->supplies);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to get supplies\n");
+	if (ret) {
+		dev_err_probe(dev, ret, "failed to get supplies\n");
+		goto put_vcm;
+	}
 
 	v4l2_i2c_subdev_init(&vcm->sd, client, &dw9763_subdev_ops);
 
 	vcm->regmap = devm_cci_regmap_init_i2c(client, 8);
-	if (IS_ERR(vcm->regmap))
-		return dev_err_probe(dev, PTR_ERR(vcm->regmap),
+	if (IS_ERR(vcm->regmap)) {
+		ret = dev_err_probe(dev, PTR_ERR(vcm->regmap),
 				     "failed to initialize CCI regmap\n");
+		goto put_vcm;
+	}
 
-	v4l2_ctrl_handler_init(&vcm->controls, 1);
+	ret = v4l2_ctrl_handler_init(&vcm->controls, 1);
+	if (ret)
+		goto put_vcm;
+	vcm->controls_initialized = true;
 	vcm->focus = v4l2_ctrl_new_std(&vcm->controls, &dw9763_ctrl_ops,
 				       V4L2_CID_FOCUS_ABSOLUTE, 0,
 				       DW9763_MAX_FOCUS, 1, 0);
 	if (vcm->controls.error) {
 		ret = vcm->controls.error;
-		goto free_controls;
+		goto put_vcm;
 	}
 
 	vcm->sd.ctrl_handler = &vcm->controls;
@@ -184,7 +289,8 @@ static int dw9763_probe(struct i2c_client *client)
 
 	ret = media_entity_pads_init(&vcm->sd.entity, 0, NULL);
 	if (ret)
-		goto free_controls;
+		goto put_vcm;
+	vcm->entity_initialized = true;
 
 	pm_runtime_set_suspended(dev);
 	pm_runtime_set_autosuspend_delay(dev, 1000);
@@ -195,11 +301,16 @@ static int dw9763_probe(struct i2c_client *client)
 		ret = dw9763_runtime_resume(dev);
 		if (ret)
 			goto disable_pm;
+		ret = v4l2_ctrl_handler_setup(&vcm->controls);
+		if (ret)
+			goto power_off;
 	}
 
 	ret = v4l2_async_register_subdev(&vcm->sd);
-	if (ret)
-		goto power_off;
+	if (ret) {
+		dw9763_shutdown(vcm);
+		goto put_vcm;
+	}
 
 	return 0;
 
@@ -209,9 +320,8 @@ power_off:
 disable_pm:
 	pm_runtime_disable(dev);
 	pm_runtime_dont_use_autosuspend(dev);
-	media_entity_cleanup(&vcm->sd.entity);
-free_controls:
-	v4l2_ctrl_handler_free(&vcm->controls);
+put_vcm:
+	kref_put(&vcm->ref, dw9763_free);
 	return ret;
 }
 
@@ -220,13 +330,8 @@ static void dw9763_remove(struct i2c_client *client)
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct dw9763 *vcm = to_dw9763(sd);
 
-	v4l2_async_unregister_subdev(sd);
-	pm_runtime_disable(vcm->dev);
-	if (!IS_ENABLED(CONFIG_PM) || !pm_runtime_status_suspended(vcm->dev))
-		dw9763_runtime_suspend(vcm->dev);
-	pm_runtime_dont_use_autosuspend(vcm->dev);
-	media_entity_cleanup(&sd->entity);
-	v4l2_ctrl_handler_free(&vcm->controls);
+	dw9763_shutdown(vcm);
+	kref_put(&vcm->ref, dw9763_free);
 }
 
 static const struct of_device_id dw9763_of_match[] = {

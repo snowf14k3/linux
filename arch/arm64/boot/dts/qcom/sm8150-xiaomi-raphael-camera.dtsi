@@ -2,8 +2,8 @@
 /*
  * Xiaomi Raphael camera wiring. Camera IDs and GPIOs follow the Android Q
  * device tree; sensor I2C addresses follow Raphael CamX module binaries.
- * Reset GPIOs are active high at TLMM to preserve the downstream high-to-low
- * power-up pulse, independent of polarity at each sensor pin.
+ * Reset GPIOs are active low: downstream releases them high after MCLK on
+ * and asserts them low at the start of power-down.
  */
 #include <dt-bindings/clock/qcom,sm8150-camcc.h>
 #include <dt-bindings/clock/qcom,gcc-sm8150.h>
@@ -21,7 +21,7 @@
 		gpio = <&tlmm 97 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
 		startup-delay-us = <135>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	camera_main_vaf: regulator-camera-main-vaf {
@@ -33,7 +33,7 @@
 		gpio = <&tlmm 83 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
 		startup-delay-us = <100>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	camera_tele_vaf: regulator-camera-tele-vaf {
@@ -45,7 +45,7 @@
 		gpio = <&tlmm 84 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
 		startup-delay-us = <100>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	camera_tele_dvdd: regulator-camera-tele-dvdd {
@@ -56,7 +56,7 @@
 		vin-supply = <&vreg_s8c_1p3>;
 		gpio = <&tlmm 93 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
-		status = "disabled";
+		status = "okay";
 	};
 
 	camera_main_dvdd: regulator-camera-main-dvdd {
@@ -67,7 +67,7 @@
 		vin-supply = <&vreg_s8c_1p3>;
 		gpio = <&tlmm 90 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
-		status = "disabled";
+		status = "okay";
 	};
 
 	camera_front_dvdd: regulator-camera-front-dvdd {
@@ -78,7 +78,7 @@
 		vin-supply = <&vreg_s8c_1p3>;
 		gpio = <&tlmm 95 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
-		status = "disabled";
+		status = "okay";
 	};
 
 	camera_ultra_dvdd: regulator-camera-ultra-dvdd {
@@ -89,7 +89,7 @@
 		vin-supply = <&vreg_s8c_1p3>;
 		gpio = <&tlmm 34 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
-		status = "disabled";
+		status = "okay";
 	};
 };
 
@@ -171,7 +171,7 @@
 		pinctrl-1 = <&camera_cci0_sleep>;
 		#address-cells = <1>;
 		#size-cells = <0>;
-		status = "disabled";
+		status = "okay";
 
 		i2c-bus@0 {
 			reg = <0>;
@@ -187,15 +187,16 @@
 				assigned-clock-rates = <19200000>;
 				pinctrl-names = "default";
 				pinctrl-0 = <&camera_mclk0_default>;
-				reset-gpios = <&tlmm 28 GPIO_ACTIVE_HIGH>;
+				reset-gpios = <&tlmm 28 GPIO_ACTIVE_LOW>;
 				dovdd-supply = <&camera_vio>;
+				aux-supply = <&vreg_l17a_3p0>;
 				avdd-supply = <&vreg_bob>;
 				dvdd-supply = <&camera_main_dvdd>;
 				custom1-supply = <&vreg_s5a_2p0>;
 				lens-focus = <&raphael_main_vcm>;
 				flash-leds = <&raphael_flash_white
 					      &raphael_flash_yellow>;
-				status = "disabled";
+				status = "okay";
 
 				port {
 					imx586_out: endpoint {
@@ -214,11 +215,13 @@
 				assigned-clock-rates = <19200000>;
 				pinctrl-names = "default";
 				pinctrl-0 = <&camera_mclk2_default>;
-				reset-gpios = <&tlmm 12 GPIO_ACTIVE_HIGH>;
+				reset-gpios = <&tlmm 12 GPIO_ACTIVE_LOW>;
 				dovdd-supply = <&camera_vio>;
+				aux-supply = <&vreg_l17a_3p0>;
 				avdd-supply = <&vreg_bob>;
 				dvdd-supply = <&camera_front_dvdd>;
-				status = "disabled";
+				popup-motor = <&popup_camera_motor>;
+				status = "okay";
 
 				port {
 					s5k3t2_out: endpoint {
@@ -245,14 +248,15 @@
 				assigned-clock-rates = <19200000>;
 				pinctrl-names = "default";
 				pinctrl-0 = <&camera_mclk1_default>;
-				reset-gpios = <&tlmm 30 GPIO_ACTIVE_HIGH>;
+				reset-gpios = <&tlmm 30 GPIO_ACTIVE_LOW>;
 				dovdd-supply = <&camera_vio>;
+				aux-supply = <&vreg_l17a_3p0>;
 				avdd-supply = <&vreg_bob>;
 				dvdd-supply = <&camera_tele_dvdd>;
 				lens-focus = <&raphael_tele_vcm>;
 				flash-leds = <&raphael_flash_white
 					      &raphael_flash_yellow>;
-				status = "disabled";
+				status = "okay";
 
 				port {
 					ov8856_out: endpoint {
@@ -284,7 +288,7 @@
 		pinctrl-1 = <&camera_cci1_sleep>;
 		#address-cells = <1>;
 		#size-cells = <0>;
-		status = "disabled";
+		status = "okay";
 
 		i2c-bus@0 {
 			reg = <0>;
@@ -300,13 +304,14 @@
 				assigned-clock-rates = <19200000>;
 				pinctrl-names = "default";
 				pinctrl-0 = <&camera_mclk3_default>;
-				reset-gpios = <&tlmm 23 GPIO_ACTIVE_HIGH>;
+				reset-gpios = <&tlmm 23 GPIO_ACTIVE_LOW>;
 				dovdd-supply = <&camera_vio>;
+				aux-supply = <&vreg_l17a_3p0>;
 				avdd-supply = <&vreg_bob>;
 				dvdd-supply = <&camera_ultra_dvdd>;
 				flash-leds = <&raphael_flash_white
 					      &raphael_flash_yellow>;
-				status = "disabled";
+				status = "okay";
 
 				port {
 					s5k3l6_out: endpoint {
@@ -453,7 +458,7 @@
 			<&mmss_noc MASTER_CAMNOC_SF 0 &mc_virt SLAVE_EBI_CH0 0>;
 		interconnect-names = "cam_ahb", "cam_hf_0_mnoc",
 				     "cam_hf_1_mnoc", "cam_sf_0_mnoc";
-		status = "disabled";
+		status = "okay";
 
 		ports {
 			#address-cells = <1>;

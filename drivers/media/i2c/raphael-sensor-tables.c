@@ -1085,8 +1085,8 @@ const struct raphael_sensor_variant raphael_ov8856 = {
  */
 static const struct raphael_sensor_reg s5k3l6_init_regs[] = {
 	{ CCI_REG16(0x0100), 0x0000, 0 },
-	{ CCI_REG16(0x0000), 0x0040, 3 },
-	{ CCI_REG16(0x0000), 0x30c6, 0 },
+	{ CCI_REG16(0x0000), 0x0040, 0 },
+	{ CCI_REG16(0x0000), 0x30c6, 3 },
 	{ CCI_REG16(0x0a02), 0x3400, 0 },
 	{ CCI_REG16(0x3084), 0x1314, 0 },
 	{ CCI_REG16(0x3266), 0x0001, 0 },
@@ -1166,7 +1166,7 @@ static const struct raphael_sensor_reg s5k3l6_stream_on_regs[] = {
 };
 
 static const struct raphael_sensor_reg s5k3l6_stream_off_regs[] = {
-	{ CCI_REG16(0x0100), 0x0000, 0 },
+	{ CCI_REG16(0x0100), 0x0000, 30000 },
 };
 
 static const struct raphael_sensor_reg s5k3l6_group_on_regs[] = {
@@ -1431,8 +1431,8 @@ const struct raphael_sensor_variant raphael_s5k3l6 = {
 static const struct raphael_sensor_reg s5k3t2_init_regs[] = {
 	{ CCI_REG16(0x6028), 0x4000, 0 },
 	{ CCI_REG16(0x0000), 0x0005, 0 },
-	{ CCI_REG16(0x0000), 0x3142, 3 },
-	{ CCI_REG16(0x6010), 0x0001, 0 },
+	{ CCI_REG16(0x0000), 0x3142, 0 },
+	{ CCI_REG16(0x6010), 0x0001, 3 },
 	{ CCI_REG16(0x6214), 0xff7d, 0 },
 	{ CCI_REG16(0x6218), 0x0000, 0 },
 	{ CCI_REG16(0x0a02), 0x003f, 0 },

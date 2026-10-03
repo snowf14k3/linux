@@ -774,6 +774,7 @@ config VIDEO_S5C73M3
 config VIDEO_RAPHAEL_SENSORS
 	tristate "Xiaomi Raphael image sensor modules"
 	depends on GPIOLIB
+	depends on TI_DRV8846 || !TI_DRV8846
 	select V4L2_CCI_I2C
 	help
 	  V4L2 RAW10 sensor support for the IMX586, OV8856, S5K3L6 and

@@ -48,7 +48,11 @@ struct camss_video {
 	unsigned int line_based;
 	const struct camss_format_info *formats;
 	unsigned int nformats;
+	bool subdevices_stopped;
+	bool dma_quarantined;
 };
+
+void camss_video_quarantine(struct camss_video *video);
 
 int msm_video_register(struct camss_video *video, struct v4l2_device *v4l2_dev,
 		       const char *name);
