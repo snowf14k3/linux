@@ -349,10 +349,7 @@ sys_get_prop_image_version(struct venus_core *core,
 	if (ret)
 		goto done;
 
-	if (IS_IRIS1(core))
-		dev_warn(dev, VDBGL "unrecognized F/W version: %.*s\n",
-			 VER_STR_SZ, img_ver);
-	else
+	if (!IS_IRIS1(core))
 		dev_err(dev, VDBGL "error reading F/W version\n");
 	return;
 

@@ -996,8 +996,6 @@ static int core_get_v4(struct venus_core *core)
 	if (!res->vcodec_pmdomains_num)
 		legacy_binding = true;
 
-	dev_info(dev, "%s legacy binding\n", legacy_binding ? "" : "non");
-
 	ret = vcodec_clks_get(core, dev, core->vcodec0_clks, res->vcodec0_clks);
 	if (ret)
 		return ret;

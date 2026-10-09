@@ -149,10 +149,6 @@ static int intbuf_alloc_secure_persist(struct venus_inst *inst,
 	if (ret)
 		goto free_dma;
 
-	dev_info(core->dev,
-		 "VENUS_SECURE_PERSIST ASSIGN iova=%pad size=%zu vmid=%u\n",
-		 &buf->da, buf->size, QCOM_SCM_VMID_CP_NON_PIXEL);
-
 	return 0;
 
 free_dma:
@@ -176,9 +172,6 @@ static int intbuf_free_memory(struct venus_inst *inst, struct intbuf *buf)
 			return ret;
 		}
 
-		dev_info(inst->core->dev,
-			 "VENUS_SECURE_PERSIST RECLAIM iova=%pad size=%zu vmid=%u\n",
-			 &buf->da, buf->size, QCOM_SCM_VMID_CP_NON_PIXEL);
 		dma_free_attrs(buf->dma_dev, buf->size, buf->va, buf->da,
 			       buf->attrs);
 		buf->va = NULL;
@@ -583,42 +576,27 @@ static int intbufs_validate_queue(struct venus_inst *inst,
 
 	req = intbufs_find_req(snapshot, V4L2_TYPE_IS_OUTPUT(type) ?
 			       HFI_BUFFER_INPUT : HFI_BUFFER_OUTPUT);
-	if (!q || !req) {
-		dev_err(inst->core->dev,
-			"IRIS1 queue contract missing type=%u q=%p req=%p\n",
-			type, q, req);
+	if (!q || !req)
 		return -EINVAL;
-	}
 
 	counts = *req;
 	count = vb2_get_num_buffers(q);
 	min_fw = hfi_bufreq_get_count_min(&counts, HFI_VERSION_4XX);
 	min_host = hfi_bufreq_get_count_min_host(&counts, HFI_VERSION_4XX);
 	minimum = max3(req->count_actual, min_fw, min_host);
-	if (!req->size || !minimum || count < minimum) {
-		dev_err(inst->core->dev,
-			"IRIS1 queue contract type=%u hfi=%#x size=%u count=%u actual=%u min=%u host=%u\n",
-			type, req->type, req->size, count, req->count_actual,
-			min_fw, min_host);
+	if (!req->size || !minimum || count < minimum)
 		return -EINVAL;
-	}
 
 	for (i = 0; i < q->max_num_buffers; i++) {
 		vb = vb2_get_buffer(q, i);
-		if (vb && vb2_plane_size(vb, 0) < req->size) {
-			dev_err(inst->core->dev,
-				"IRIS1 queue extent type=%u hfi=%#x index=%u plane=%lu required=%u\n",
-				type, req->type, i, vb2_plane_size(vb, 0),
-				req->size);
+		if (vb && vb2_plane_size(vb, 0) < req->size)
 			return -EINVAL;
-		}
 	}
 
 	return 0;
 }
 
-static int intbufs_validate_snapshot(struct venus_inst *inst,
-				     const union hfi_get_property *snapshot)
+static int intbufs_validate_snapshot(const union hfi_get_property *snapshot)
 {
 	unsigned int i, j;
 
@@ -626,14 +604,9 @@ static int intbufs_validate_snapshot(struct venus_inst *inst,
 	for (i = 0; i < HFI_BUFFER_TYPE_MAX; i++) {
 		if (!snapshot->bufreq[i].type)
 			continue;
-		for (j = i + 1; j < HFI_BUFFER_TYPE_MAX; j++) {
-			if (snapshot->bufreq[i].type != snapshot->bufreq[j].type)
-				continue;
-			dev_err(inst->core->dev,
-				"IRIS1 duplicate requirement type=%#x slots=%u/%u\n",
-				snapshot->bufreq[i].type, i, j);
-			return -EINVAL;
-		}
+		for (j = i + 1; j < HFI_BUFFER_TYPE_MAX; j++)
+			if (snapshot->bufreq[i].type == snapshot->bufreq[j].type)
+				return -EINVAL;
 	}
 
 	/* Internal buffers follow firmware count_actual, as in downstream. */
@@ -663,7 +636,7 @@ static int intbufs_alloc_iris1_encoder(struct venus_inst *inst)
 	if (ret)
 		return ret;
 
-	ret = intbufs_validate_snapshot(inst, &snapshot);
+	ret = intbufs_validate_snapshot(&snapshot);
 	if (ret)
 		return ret;
 
@@ -2086,7 +2059,6 @@ EXPORT_SYMBOL_GPL(venus_helper_buffers_done);
 
 int venus_helper_session_release(struct venus_inst *inst)
 {
-	const char *stage = "idle";
 	int abort_ret, err = 0, ret;
 
 	if (inst->state == INST_UNINIT)
@@ -2094,12 +2066,10 @@ int venus_helper_session_release(struct venus_inst *inst)
 
 	if (inst->session_error || test_bit(0, &inst->core->sys_error)) {
 		err = -EIO;
-		stage = "session-error";
 		goto abort;
 	}
 
 	if (inst->state == INST_START) {
-		stage = "stop";
 		ret = hfi_session_stop(inst);
 		if (ret) {
 			err = ret;
@@ -2109,12 +2079,10 @@ int venus_helper_session_release(struct venus_inst *inst)
 
 	if (inst->state == INST_LOAD_RESOURCES) {
 		err = -EINVAL;
-		stage = "loaded-without-start";
 		goto abort;
 	}
 
 	if (inst->state == INST_STOP) {
-		stage = "unload-resources";
 		ret = hfi_session_unload_res(inst);
 		if (ret) {
 			err = ret;
@@ -2122,21 +2090,18 @@ int venus_helper_session_release(struct venus_inst *inst)
 		}
 	}
 
-	stage = "unregister-buffers";
 	ret = venus_helper_unregister_bufs(inst);
 	if (ret) {
 		err = ret;
 		goto abort;
 	}
 
-	stage = "free-internal-buffers";
 	ret = venus_helper_intbufs_free(inst);
 	if (ret) {
 		err = ret;
 		goto abort;
 	}
 
-	stage = "end";
 	ret = hfi_session_deinit(inst);
 	if (ret) {
 		err = ret;
@@ -2147,9 +2112,6 @@ int venus_helper_session_release(struct venus_inst *inst)
 	return 0;
 
 abort:
-	dev_err(inst->core->dev,
-		"session release failed stage=%s state=%u ret=%d, aborting\n",
-		stage, inst->state, err);
 	abort_ret = hfi_session_abort(inst);
 	if (!abort_ret)
 		inst->state = INST_UNINIT;
@@ -2255,54 +2217,24 @@ int venus_helper_vb2_start_streaming(struct venus_inst *inst)
 	int ret;
 
 	ret = venus_helper_intbufs_alloc(inst);
-	if (ret) {
-		if (IS_IRIS1(inst->core) &&
-		    inst->session_type == VIDC_SESSION_TYPE_ENC)
-			dev_err(inst->core->dev,
-				"IRIS1 encoder firmware-start stage=internal-buffers ret=%d\n",
-				ret);
+	if (ret)
 		return ret;
-	}
 
 	ret = session_register_bufs(inst);
-	if (ret) {
-		if (IS_IRIS1(inst->core) &&
-		    inst->session_type == VIDC_SESSION_TYPE_ENC)
-			dev_err(inst->core->dev,
-				"IRIS1 encoder firmware-start stage=register-buffers ret=%d\n",
-				ret);
+	if (ret)
 		goto err_bufs_free;
-	}
 
 	ret = venus_pm_load_scale(inst);
-	if (ret) {
-		if (IS_IRIS1(inst->core) &&
-		    inst->session_type == VIDC_SESSION_TYPE_ENC)
-			dev_err(inst->core->dev,
-				"IRIS1 encoder firmware-start stage=load-scale ret=%d\n",
-				ret);
+	if (ret)
 		goto err_unreg_bufs;
-	}
 
 	ret = hfi_session_load_res(inst);
-	if (ret) {
-		if (IS_IRIS1(inst->core) &&
-		    inst->session_type == VIDC_SESSION_TYPE_ENC)
-			dev_err(inst->core->dev,
-				"IRIS1 encoder firmware-start stage=load-resources ret=%d\n",
-				ret);
+	if (ret)
 		goto err_unreg_bufs;
-	}
 
 	ret = hfi_session_start(inst);
-	if (ret) {
-		if (IS_IRIS1(inst->core) &&
-		    inst->session_type == VIDC_SESSION_TYPE_ENC)
-			dev_err(inst->core->dev,
-				"IRIS1 encoder firmware-start stage=session-start ret=%d\n",
-				ret);
+	if (ret)
 		goto err_unload_res;
-	}
 
 	return 0;
 
