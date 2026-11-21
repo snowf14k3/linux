@@ -349,10 +349,28 @@ static int say_hello(struct sockaddr_qrtr *dest)
 	return ret;
 }
 
+/* Forget the observers registered by a node when it leaves or restarts. */
+static void lookups_del_node(unsigned int node_id)
+{
+	struct qrtr_lookup *lookup, *tmp;
+
+	list_for_each_entry_safe(lookup, tmp, &qrtr_ns.lookups, li) {
+		if (lookup->sq.sq_node != node_id)
+			continue;
+
+		list_del(&lookup->li);
+		kfree(lookup);
+		qrtr_ns.lookup_count--;
+	}
+}
+
 /* Announce the list of servers registered on the local node */
 static int ctrl_cmd_hello(struct sockaddr_qrtr *sq)
 {
 	int ret;
+
+	if (sq->sq_node != qrtr_ns.local_node)
+		lookups_del_node(sq->sq_node);
 
 	ret = say_hello(sq);
 	if (ret < 0)
@@ -375,6 +393,9 @@ static int ctrl_cmd_bye(struct sockaddr_qrtr *from)
 
 	iv.iov_base = &pkt;
 	iv.iov_len = sizeof(pkt);
+
+	if (from->sq_node != qrtr_ns.local_node)
+		lookups_del_node(from->sq_node);
 
 	node = node_get(from->sq_node);
 	if (!node)
@@ -572,10 +593,7 @@ static int ctrl_cmd_new_lookup(struct sockaddr_qrtr *from,
 	unsigned long node_idx;
 	unsigned long srv_idx;
 
-	/* Accept only local observers */
-	if (from->sq_node != qrtr_ns.local_node)
-		return -EINVAL;
-
+	/* The modem also needs to look up AP services such as remote storage. */
 	if (qrtr_ns.lookup_count >= QRTR_NS_MAX_LOOKUPS) {
 		pr_err_ratelimited("QRTR client node exceeds max lookup limit!\n");
 		return -ENOSPC;
