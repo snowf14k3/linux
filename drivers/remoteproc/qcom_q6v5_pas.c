@@ -26,6 +26,7 @@
 #include <linux/soc/qcom/mdt_loader.h>
 #include <linux/soc/qcom/smem.h>
 #include <linux/soc/qcom/smem_state.h>
+#include <soc/qcom/rpmhpd.h>
 
 #include "qcom_common.h"
 #include "qcom_pil_info.h"
@@ -33,6 +34,7 @@
 #include "remoteproc_internal.h"
 
 #define QCOM_PAS_DECRYPT_SHUTDOWN_DELAY_MS	100
+#define RAPHAEL_MODEM_RPMHPD_TIMEOUT_MS		120000
 
 #define MAX_ASSIGN_COUNT 3
 
@@ -276,6 +278,15 @@ static int qcom_pas_start(struct rproc *rproc)
 {
 	struct qcom_pas *pas = rproc->priv;
 	int ret;
+
+	/* Let RPMh finish its initial power-domain votes before starting MPSS. */
+	if (of_machine_is_compatible("xiaomi,raphael") &&
+	    of_device_is_compatible(pas->dev->of_node, "qcom,sm8150-mpss-pas")) {
+		ret = qcom_rpmhpd_wait_sync(RAPHAEL_MODEM_RPMHPD_TIMEOUT_MS);
+		if (ret)
+			return dev_err_probe(pas->dev, ret,
+					     "RPMh power domains did not sync before modem start\n");
+	}
 
 	ret = qcom_q6v5_prepare(&pas->q6v5);
 	if (ret)
