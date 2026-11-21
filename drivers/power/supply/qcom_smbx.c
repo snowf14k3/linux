@@ -1262,12 +1262,20 @@ static void smb_external_power_changed(struct power_supply *psy)
 static int smb_get_iio_chan(struct smb_chip *chip, struct iio_channel *chan,
 			     int *val)
 {
+	int ret;
+
 	if (IS_ERR(chan)) {
 		*val = 0;
 		return 0;
 	}
 
-	return iio_read_channel_processed(chan, val);
+	ret = iio_read_channel_processed(chan, val);
+	/* Restart the PM8150B USB ADC conversion after a transient timeout. */
+	if (ret == -ETIMEDOUT &&
+	    of_device_is_compatible(chip->dev->of_node, "qcom,pm8150b-charger"))
+		ret = iio_read_channel_processed(chan, val);
+
+	return ret;
 }
 
 static int smb5_get_prop_health(struct smb_chip *chip, int *val)
