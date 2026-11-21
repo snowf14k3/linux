@@ -2,8 +2,10 @@
 /* Copyright (c) 2018, The Linux Foundation. All rights reserved.*/
 
 #include <linux/cleanup.h>
+#include <linux/completion.h>
 #include <linux/err.h>
 #include <linux/init.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -14,6 +16,7 @@
 #include <linux/pm_opp.h>
 #include <soc/qcom/cmd-db.h>
 #include <soc/qcom/rpmh.h>
+#include <soc/qcom/rpmhpd.h>
 #include <dt-bindings/power/qcom-rpmpd.h>
 #include <dt-bindings/power/qcom,rpmhpd.h>
 
@@ -65,6 +68,7 @@ struct rpmhpd_desc {
 };
 
 static DEFINE_MUTEX(rpmhpd_lock);
+static DECLARE_COMPLETION(rpmhpd_sync_done);
 
 /* RPMH powerdomains */
 
@@ -1218,7 +1222,18 @@ static void rpmhpd_sync_state(struct device *dev)
 			dev_err(dev, "failed to sync %s\n", pd->res_name);
 	}
 	mutex_unlock(&rpmhpd_lock);
+	complete_all(&rpmhpd_sync_done);
 }
+
+int qcom_rpmhpd_wait_sync(unsigned long timeout_ms)
+{
+	if (!wait_for_completion_timeout(&rpmhpd_sync_done,
+					 msecs_to_jiffies(timeout_ms)))
+		return -ETIMEDOUT;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qcom_rpmhpd_wait_sync);
 
 static struct platform_driver rpmhpd_driver = {
 	.driver = {

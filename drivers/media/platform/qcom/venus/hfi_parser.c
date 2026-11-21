@@ -285,7 +285,7 @@ static int hfi_platform_parser(struct venus_core *core, struct venus_inst *inst)
 		return -EINVAL;
 
 	core->enc_codecs = enc_codecs;
-	core->dec_codecs = dec_codecs;
+	core->dec_codecs = dec_codecs & ~core->res->dec_codec_blacklist;
 	core->codecs_count = count;
 	core->max_sessions_supported = MAX_SESSIONS;
 	memset(core->caps, 0, sizeof(*caps) * MAX_CODEC_NUM);

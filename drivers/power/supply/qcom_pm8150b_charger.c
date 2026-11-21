@@ -26,6 +26,7 @@
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
@@ -367,6 +368,12 @@ struct pm8150b_chg {
 	struct regmap		*regmap;
 	struct power_supply	*battery;
 	struct power_supply	*usb;
+	struct power_supply_desc battery_desc;
+	struct power_supply_desc usb_desc;
+	struct mutex		charge_lock;
+	bool			charge_inhibited;
+	bool			ready;
+	bool			stopping;
 
 	/* charge limits, in micro-units, from the battery profile / DT */
 	unsigned int		fv_uv;
@@ -435,6 +442,7 @@ struct pm8150b_chg {
 	 * wire carries, see chg_get_vbus_uv().
 	 */
 	struct iio_channel	*vbus;
+	struct iio_channel	*ibus;
 
 	/* Requested IRQs, held for the unload sequence, see chg_remove(). */
 	int			*irqs;
@@ -1061,19 +1069,23 @@ static int chg_set_icl(struct pm8150b_chg *chg, unsigned int icl_ua)
  * its class.  Boards that do not wire the ADC simply have no second
  * opinion.
  */
-static int chg_get_vbus_uv(struct pm8150b_chg *chg, int *vbus_uv)
+static int chg_read_input(struct iio_channel *channel, int *value)
 {
-	int val, rc;
+	int ret;
 
-	if (!chg->vbus)
+	if (!channel)
 		return -ENODATA;
 
-	rc = iio_read_channel_processed(chg->vbus, &val);
-	if (rc < 0)
-		return rc;
+	ret = iio_read_channel_processed(channel, value);
+	if (ret == -ETIMEDOUT)
+		ret = iio_read_channel_processed(channel, value);
 
-	*vbus_uv = val;
-	return 0;
+	return ret;
+}
+
+static int chg_get_vbus_uv(struct pm8150b_chg *chg, int *vbus_uv)
+{
+	return chg_read_input(chg->vbus, vbus_uv);
 }
 
 /*
@@ -1374,12 +1386,12 @@ rollback:
 	return rc;
 }
 
-static void chg_cp_disable(struct pm8150b_chg *chg)
+static int chg_cp_disable(struct pm8150b_chg *chg)
 {
 	int rc;
 
 	if (!chg->cp_active)
-		return;
+		return 0;
 
 	rc = regulator_disable(chg->cp);
 	if (rc < 0)
@@ -1391,9 +1403,13 @@ static void chg_cp_disable(struct pm8150b_chg *chg)
 			 SMB_EN_OVERRIDE);
 	chg_masked_write(chg, MISC_SMB_CFG, SMB_EN_SEL, 0);
 
+	if (rc < 0)
+		return rc;
+
 	chg->cp_active = false;
 	chg->cp_ilim_ua = 0;
 	dev_info(chg->dev, "charge pump inactive\n");
+	return 0;
 }
 
 /*
@@ -1622,6 +1638,19 @@ static int chg_usb_get_property(struct power_supply *psy,
 	unsigned int tmp;
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		val->intval = READ_ONCE(chg->charge_inhibited) ?
+			POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE :
+			POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
+		return 0;
+	case POWER_SUPPLY_PROP_STATUS:
+		return chg_get_status(chg, &val->intval);
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+		return chg_read_input(chg->ibus, &val->intval);
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		if (chg->vbus)
+			return chg_get_vbus_uv(chg, &val->intval);
+		break;
 	case POWER_SUPPLY_PROP_ONLINE:
 		return chg_usb_online(chg, &val->intval);
 	case POWER_SUPPLY_PROP_PRESENT:
@@ -1661,12 +1690,51 @@ static int chg_usb_get_property(struct power_supply *psy,
 	return rc;
 }
 
+static int chg_set_charge_behaviour(struct pm8150b_chg *chg, int behaviour)
+{
+	int ret = 0, rc;
+
+	if (behaviour != POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO &&
+	    behaviour != POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE)
+		return -EINVAL;
+
+	mutex_lock(&chg->charge_lock);
+	if (!chg->ready || chg->stopping) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+
+	WRITE_ONCE(chg->charge_inhibited,
+		   behaviour == POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE);
+
+	/* Leave USB input online, but stop both battery charging paths. */
+	if (chg->charge_inhibited) {
+		ret = chg_cp_disable(chg);
+		rc = chg_enable(chg, false);
+		if (!rc)
+			chg->charge_allowed = false;
+		else if (!ret)
+			ret = rc;
+	}
+
+	/* Resume through the normal temperature and step charging policy. */
+	mod_delayed_work(system_percpu_wq, &chg->status_work, 0);
+	power_supply_changed(chg->battery);
+	if (chg->usb)
+		power_supply_changed(chg->usb);
+unlock:
+	mutex_unlock(&chg->charge_lock);
+	return ret;
+}
+
 static int chg_usb_set_property(struct power_supply *psy,
 				enum power_supply_property psp,
 				const union power_supply_propval *val)
 {
 	struct pm8150b_chg *chg = power_supply_get_drvdata(psy);
 
+	if (psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR)
+		return chg_set_charge_behaviour(chg, val->intval);
 	if (psp != POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT)
 		return -EINVAL;
 
@@ -1678,7 +1746,8 @@ static int chg_usb_set_property(struct power_supply *psy,
 static int chg_usb_property_is_writeable(struct power_supply *psy,
 					 enum power_supply_property psp)
 {
-	return psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT;
+	return psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT ||
+	       psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR;
 }
 
 static enum power_supply_property chg_battery_props[] = {
@@ -1699,6 +1768,9 @@ static enum power_supply_property chg_battery_props[] = {
 static enum power_supply_property chg_usb_props[] = {
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
 	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 	POWER_SUPPLY_PROP_TYPE,
@@ -1717,6 +1789,8 @@ static const struct power_supply_desc chg_battery_desc = {
 static const struct power_supply_desc chg_usb_desc = {
 	.name		= "usb",
 	.type		= POWER_SUPPLY_TYPE_USB,
+	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
+			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
 	.usb_types	= BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
 			  BIT(POWER_SUPPLY_USB_TYPE_SDP) |
 			  BIT(POWER_SUPPLY_USB_TYPE_CDP) |
@@ -1877,10 +1951,15 @@ static void chg_status_work(struct work_struct *work)
 		container_of(work, struct pm8150b_chg, status_work.work);
 	bool changed = false;
 	bool allow = true;
+	bool temp_read_ok;
 	bool want_cp;
 	unsigned int delay_ms;
 	int status, online, present, capacity, temp;
 	int current_ua;
+
+	mutex_lock(&chg->charge_lock);
+	if (chg->stopping)
+		goto unlock;
 
 	if (!chg_usb_online(chg, &online) && online != chg->usb_online) {
 		chg->usb_online = online;
@@ -1928,7 +2007,8 @@ static void chg_status_work(struct work_struct *work)
 		changed = true;
 	}
 
-	if (!fg_read_temp(chg, &temp) && temp != chg->temp_deci) {
+	temp_read_ok = !fg_read_temp(chg, &temp);
+	if (temp_read_ok && (!chg->temp_valid || temp != chg->temp_deci)) {
 		chg->temp_deci = temp;
 		chg->temp_valid = true;
 		changed = true;
@@ -1955,19 +2035,24 @@ static void chg_status_work(struct work_struct *work)
 				changed = true;
 			if (chg->warm_hold)
 				allow = false;
-		} else if (++chg->temp_bad >= TEMP_BAD_SAMPLES) {
+		} else if (++chg->temp_bad >= TEMP_BAD_SAMPLES ||
+			   !chg->charge_allowed) {
 			allow = false;
 		}
+	}
 
-		if (allow != chg->charge_allowed) {
-			if (chg_enable(chg, allow)) {
-				/* Leave the flag alone so this is retried. */
-				dev_warn(chg->dev, "failed to %s charging\n",
-					 allow ? "resume" : "hold off");
-			} else {
-				chg->charge_allowed = allow;
-				changed = true;
-			}
+	if (chg->charge_inhibited || (!temp_read_ok && !chg->charge_allowed))
+		allow = false;
+
+	if ((chg->temp_valid || chg->charge_inhibited) &&
+	    allow != chg->charge_allowed) {
+		if (chg_enable(chg, allow)) {
+			/* Leave the flag alone so this is retried. */
+			dev_warn(chg->dev, "failed to %s charging\n",
+				 allow ? "resume" : "hold off");
+		} else {
+			chg->charge_allowed = allow;
+			changed = true;
 		}
 	}
 
@@ -1985,7 +2070,8 @@ static void chg_status_work(struct work_struct *work)
 	if (chg_cp_check(chg))
 		changed = true;
 
-	want_cp = chg->cp && chg->usb_present && chg->src_qc3 &&
+	want_cp = !chg->charge_inhibited && chg->cp &&
+		  chg->usb_present && chg->src_qc3 &&
 		  chg->status == POWER_SUPPLY_STATUS_CHARGING &&
 		  chg->src_voltage_uv >= CP_INPUT_MIN_UV &&
 		  chg_cp_vbus_ok(chg) && chg->charge_allowed &&
@@ -2008,8 +2094,7 @@ static void chg_status_work(struct work_struct *work)
 					 "failed to start the charge pump\n");
 			}
 		} else {
-			chg_cp_disable(chg);
-			ok = true;
+			ok = !chg_cp_disable(chg);
 		}
 
 		if (ok) {
@@ -2031,24 +2116,19 @@ static void chg_status_work(struct work_struct *work)
 	 * first sample lands and while the cell is outside its safe range,
 	 * where prompt action matters; a half-minute is plenty otherwise.
 	 */
-	delay_ms = (chg->temp_valid && !chg->temp_bad) ? 30000 : 5000;
+	delay_ms = (temp_read_ok && !chg->temp_bad) ? 30000 : 5000;
 	schedule_delayed_work(&chg->status_work,
 			      round_jiffies_relative(msecs_to_jiffies(delay_ms)));
+unlock:
+	mutex_unlock(&chg->charge_lock);
 }
 
-static irqreturn_t chg_plugin_irq(int irq, void *data)
+static irqreturn_t chg_status_irq(int irq, void *data)
 {
 	struct pm8150b_chg *chg = data;
 
-	schedule_delayed_work(&chg->status_work, 0);
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t chg_state_irq(int irq, void *data)
-{
-	struct pm8150b_chg *chg = data;
-
-	schedule_delayed_work(&chg->status_work, 0);
+	if (smp_load_acquire(&chg->ready))
+		schedule_delayed_work(&chg->status_work, 0);
 	return IRQ_HANDLED;
 }
 
@@ -2058,9 +2138,9 @@ struct chg_irq {
 };
 
 static const struct chg_irq chg_irqs[] = {
-	{ "usbin-plugin",		chg_plugin_irq },
-	{ "usbin-src-change",		chg_plugin_irq },
-	{ "chg-state-change",		chg_state_irq },
+	{ "usbin-plugin",		chg_status_irq },
+	{ "usbin-src-change",		chg_status_irq },
+	{ "chg-state-change",		chg_status_irq },
 };
 
 /* ------------------------------- probe -------------------------------- */
@@ -2276,18 +2356,6 @@ static int chg_hw_init(struct pm8150b_chg *chg)
 	if (rc < 0)
 		return rc;
 
-	/*
-	 * Re-run detection with the QC handshake on: a source plugged in
-	 * before the driver loaded is otherwise never handshaked.  It is
-	 * queued ahead of the input update so a stale verdict cannot start
-	 * the QC3 boost before the fresh detection has had the pair.
-	 */
-	chg->detecting = true;
-	schedule_delayed_work(&chg->detect_work, msecs_to_jiffies(700));
-
-	/* Take whatever the attached source is good for. */
-	chg_update_input(chg);
-
 	/* Charging is enabled; only the battery's policy can hold it off. */
 	chg->charge_allowed = true;
 	return 0;
@@ -2304,6 +2372,13 @@ static int chg_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	chg->dev = &pdev->dev;
+	mutex_init(&chg->charge_lock);
+	chg->battery_desc = chg_battery_desc;
+	chg->usb_desc = chg_usb_desc;
+	if (of_machine_is_compatible("xiaomi,raphael")) {
+		chg->battery_desc.name = "qcom-battery";
+		chg->usb_desc.name = "pm8150b-charger";
+	}
 	platform_set_drvdata(pdev, chg);
 
 	chg->regmap = dev_get_regmap(pdev->dev.parent, NULL);
@@ -2347,6 +2422,14 @@ static int chg_probe(struct platform_device *pdev)
 		chg->vbus = NULL;
 	}
 
+	chg->ibus = devm_iio_channel_get(chg->dev, "ibus");
+	if (IS_ERR(chg->ibus)) {
+		if (PTR_ERR(chg->ibus) != -ENODEV)
+			return dev_err_probe(chg->dev, PTR_ERR(chg->ibus),
+					     "ibus ADC\n");
+		chg->ibus = NULL;
+	}
+
 	INIT_DEFERRABLE_WORK(&chg->status_work, chg_status_work);
 	INIT_DEFERRABLE_WORK(&chg->detect_work, chg_detect_work);
 	INIT_DEFERRABLE_WORK(&chg->qc3_work, chg_qc3_work);
@@ -2357,7 +2440,7 @@ static int chg_probe(struct platform_device *pdev)
 
 	cfg.drv_data = chg;
 
-	chg->battery = devm_power_supply_register(chg->dev, &chg_battery_desc,
+	chg->battery = devm_power_supply_register(chg->dev, &chg->battery_desc,
 						  &cfg);
 	if (IS_ERR(chg->battery))
 		return dev_err_probe(chg->dev, PTR_ERR(chg->battery),
@@ -2371,10 +2454,27 @@ static int chg_probe(struct platform_device *pdev)
 	if (rc < 0)
 		return rc;
 
-	chg->usb = devm_power_supply_register(chg->dev, &chg_usb_desc, &cfg);
+	chg->usb = devm_power_supply_register(chg->dev, &chg->usb_desc, &cfg);
 	if (IS_ERR(chg->usb))
 		return dev_err_probe(chg->dev, PTR_ERR(chg->usb),
 				     "usb psy\n");
+
+	/* The workers may now use both registered power supplies. */
+	mutex_lock(&chg->charge_lock);
+	/*
+	 * Re-run detection with the QC handshake on: a source plugged in
+	 * before the driver loaded is otherwise never handshaked.  It is
+	 * queued ahead of the input update so a stale verdict cannot start
+	 * the QC3 boost before the fresh detection has had the pair.
+	 */
+	chg->detecting = true;
+	schedule_delayed_work(&chg->detect_work, msecs_to_jiffies(700));
+
+	/* Take whatever the attached source is good for. */
+	chg_update_input(chg);
+
+	smp_store_release(&chg->ready, true);
+	mutex_unlock(&chg->charge_lock);
 
 	/* Prime the cached state, including the battery temperature. */
 	schedule_delayed_work(&chg->status_work, 0);
@@ -2389,6 +2489,10 @@ static void chg_remove(struct platform_device *pdev)
 {
 	struct pm8150b_chg *chg = platform_get_drvdata(pdev);
 	int i;
+
+	mutex_lock(&chg->charge_lock);
+	chg->stopping = true;
+	mutex_unlock(&chg->charge_lock);
 
 	/*
 	 * The IRQs feed the pollers below and the pollers re-arm each

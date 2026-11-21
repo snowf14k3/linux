@@ -138,6 +138,12 @@
 				label = "chg_temp";
 			};
 
+			channel@7 {
+				reg = <ADC5_USB_IN_I>;
+				qcom,pre-scaling = <1 1>;
+				label = "usbin_i";
+			};
+
 			channel@8 {
 				reg = <ADC5_USB_IN_V_16>;
 				qcom,pre-scaling = <1 16>;

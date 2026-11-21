@@ -1159,8 +1159,9 @@
 	 * the adapter; this says what the wire really carries, and the
 	 * charge pump is only started on the two agreeing.
 	 */
-	io-channels = <&pm8150b_adc ADC5_USB_IN_V_16>;
-	io-channel-names = "vbus";
+	io-channels = <&pm8150b_adc ADC5_USB_IN_V_16>,
+		      <&pm8150b_adc ADC5_USB_IN_I>;
+	io-channel-names = "vbus", "ibus";
 
 	/*
 	 * BC1.2 and the QC handshake watch and drive the very D+/D- pair the
@@ -1500,4 +1501,9 @@
 			sound-dai = <&tfa9874>;
 		};
 	};
+};
+
+&venus {
+	firmware-name = "qcom/sm8150/Xiaomi/raphael/venus.mbn";
+	status = "okay";
 };
